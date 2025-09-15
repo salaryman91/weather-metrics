@@ -1,0 +1,24 @@
+name: uv-kmahub
+on:
+  schedule:
+    - cron: "15 * * * *"   # 매 정시 +15분(UTC)
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      INFLUX_URL:    ${{ secrets.INFLUX_URL }}
+      INFLUX_TOKEN:  ${{ secrets.INFLUX_TOKEN }}
+      INFLUX_ORG:    ${{ secrets.INFLUX_ORG }}
+      INFLUX_BUCKET: ${{ secrets.INFLUX_BUCKET }}
+      APIHUB_BASE:   ${{ secrets.APIHUB_BASE }}
+      APIHUB_KEY:    ${{ secrets.APIHUB_KEY }}
+      UV_STN:        ${{ vars.UV_STN }}
+      LOC:           ${{ vars.LOC || 'seoul' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - run: npm i -D typescript ts-node dotenv-cli @types/node
+      - run: npx ts-node scripts/uv_to_influx.ts
