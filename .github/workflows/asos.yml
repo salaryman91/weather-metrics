@@ -12,8 +12,8 @@ jobs:
       INFLUX_TOKEN:  ${{ secrets.INFLUX_TOKEN }}
       INFLUX_ORG:    ${{ secrets.INFLUX_ORG }}
       INFLUX_BUCKET: ${{ secrets.INFLUX_BUCKET }}
-      APIHUB_BASE:   ${{ secrets.APIHUB_BASE }}
       APIHUB_KEY:    ${{ secrets.APIHUB_KEY }}
+      APIHUB_BASE:   ${{ vars.APIHUB_BASE }}
       ASOS_STN:      ${{ vars.ASOS_STN }}
       LOC:           ${{ vars.LOC || 'seoul' }}
     steps:
