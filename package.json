@@ -1,0 +1,28 @@
+{
+  "name": "weather-metrics",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev:pop": "dotenv -e .env -- ts-node scripts/pop_kmahub_to_influx.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/salaryman91/weather-metrics.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/salaryman91/weather-metrics/issues"
+  },
+  "homepage": "https://github.com/salaryman91/weather-metrics#readme",
+  "devDependencies": {
+    "@types/node": "^24.4.0",
+    "dotenv-cli": "^10.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.2"
+  }
+}

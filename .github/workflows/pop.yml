@@ -1,0 +1,32 @@
+name: pop-kmahub-schedule
+on:
+  schedule:
+    # KST 02/05/08/11/14/17/20/23 발표 +10분 (UTC 기준)
+    - cron: "10 2  * * *"
+    - cron: "10 5  * * *"
+    - cron: "10 8  * * *"
+    - cron: "10 11 * * *"
+    - cron: "10 14 * * *"
+    - cron: "10 17 * * *"
+    - cron: "10 20 * * *"
+    - cron: "10 23 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      INFLUX_URL:    ${{ secrets.INFLUX_URL }}
+      INFLUX_TOKEN:  ${{ secrets.INFLUX_TOKEN }}
+      INFLUX_ORG:    ${{ secrets.INFLUX_ORG }}
+      INFLUX_BUCKET: ${{ secrets.INFLUX_BUCKET }}
+      APIHUB_BASE:   ${{ secrets.APIHUB_BASE }}
+      APIHUB_KEY:    ${{ secrets.APIHUB_KEY }}
+      POP_REG:       ${{ vars.POP_REG }}
+      LOC:           ${{ vars.LOC || 'seoul' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - run: npm i -D typescript ts-node dotenv-cli @types/node
+      - run: npx ts-node scripts/pop_kmahub_to_influx.ts
