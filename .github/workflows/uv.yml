@@ -1,7 +1,7 @@
 name: uv-kmahub
 on:
   schedule:
-    - cron: "15 * * * *"   # 매 정시 +15분(UTC)
+    - cron: "*/10 * * * *"   # 10분마다
   workflow_dispatch: {}
 
 jobs:
@@ -13,7 +13,7 @@ jobs:
       INFLUX_ORG:    ${{ secrets.INFLUX_ORG }}
       INFLUX_BUCKET: ${{ secrets.INFLUX_BUCKET }}
       APIHUB_KEY:    ${{ secrets.APIHUB_KEY }}
-      APIHUB_BASE:   ${{ vars.APIHUB_BASE }}      
+      APIHUB_BASE:   ${{ vars.APIHUB_BASE }}
       UV_STN:        ${{ vars.UV_STN }}
       LOC:           ${{ vars.LOC || 'seoul' }}
     steps:
@@ -22,4 +22,11 @@ jobs:
         with: { node-version: "20" }
       - run: npm i -D typescript ts-node dotenv-cli @types/node
       - run: npm i iconv-lite
+
+      - name: Jitter (scheduled only)
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          # 60~120초 랜덤 대기
+          sleep $((RANDOM % 61 + 60))
+
       - run: npx ts-node scripts/uv_to_influx.ts
