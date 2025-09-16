@@ -18,9 +18,9 @@ jobs:
       TZ: Asia/Seoul
 
       # Influx
-      INFLUX_URL:     ${{ vars.INFLUX_URL }}
-      INFLUX_ORG:     ${{ vars.INFLUX_ORG }}
-      INFLUX_BUCKET:  ${{ vars.INFLUX_BUCKET }}
+      INFLUX_URL:     ${{ secrets.INFLUX_URL }}
+      INFLUX_ORG:     ${{ secrets.INFLUX_ORG }}
+      INFLUX_BUCKET:  ${{ secrets.INFLUX_BUCKET }}
       INFLUX_TOKEN:   ${{ secrets.INFLUX_TOKEN }}
 
       # KMA API
