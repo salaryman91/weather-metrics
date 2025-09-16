@@ -6,10 +6,10 @@ import "dotenv/config";
  *   Source: KMA API Hub Ultra Short NOWCAST (getUltraSrtNcst)
  *   사용 카테고리: T1H(기온, °C), REH(습도, %), WSD(풍속, m/s)
  *
- * Ncst 규칙:
- *   - base_time은 "HH00" 정시 단위 (데이터는 보통 매시+10분 이후 제공)
- *   - 분<10이면 이전 시각 HH-1 00, 그 외엔 현재 HH00
- *   - 빈 응답 대비: 최근 2~3개 HH00 슬롯을 순차 시도
+ * Ncst 규칙(실전 안정화):
+ *   - 기준시각은 **HH00, HH30** (두 가지 모두 존재)
+ *   - 데이터는 보통 기준시각 +10분 안팎부터 유효
+ *   - 항상 "가장 최근 유효한 반시간 슬롯"을 찾고, 실패 시 30분 단위로 여러 슬롯을 백오프
  *
  * Measurement (precision=s)
  *   life_index,source=kma-ultra-ncst,loc=<>,stn=<108>,method=hi|wc|at
@@ -28,33 +28,37 @@ const env = process.env as unknown as Env;
 const need = (k: keyof Env) => { const v = env[k]; if (!v) throw new Error(`[FATAL] Missing env: ${k}`); return v; };
 const DBG = !!(process.env.DEBUG || process.env.DEBUG_FEELS);
 
+// ---------- time utils ----------
 const pad2 = (n: number) => String(n).padStart(2, "0");
 const toIsoKst = (yyyymmdd: string, hhmm: string) =>
   `${yyyymmdd.slice(0,4)}-${yyyymmdd.slice(4,6)}-${yyyymmdd.slice(6,8)}T${hhmm.slice(0,2)}:${hhmm.slice(2,4)}:00+09:00`;
 const toEpochSec = (iso: string) => Math.floor(new Date(iso).getTime() / 1000);
+const yyyymmdd = (d: Date) => `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}`;
 
-function yyyymmdd(d: Date) {
-  return `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}`;
-}
-
-/** Ncst용 base_time 후보: 전/현 시각 HH00 (분<10이면 이전 정시부터 시작) + 추가 한 시간 */
-function ncstBaseCandidates(now = new Date()): Array<{base_date:string;base_time:string}> {
+/** 최근 유효 반시간(anchor) 산정: 
+ *   m>=40 → HH30
+ *   10<=m<40 → HH00
+ *   m<10 → (HH-1)30
+ * 이후 30분 단위로 최대 4~6개 슬롯 백오프
+ */
+function halfHourAnchors(now = new Date(), depth = 6): Array<{base_date:string;base_time:string}> {
   const d = new Date(now);
   const m = d.getMinutes();
-  // 시작점: 정시로 스냅
-  if (m < 10) d.setHours(d.getHours() - 1);
-  d.setMinutes(0, 0, 0);
-  const slots: Array<{base_date:string;base_time:string}> = [];
-  for (let i=0; i<3; i++) { // 최근 3개 정시
-    const t = new Date(d.getTime() - i * 3600_000);
-    const bd = yyyymmdd(t);
-    const bt = `${pad2(t.getHours())}00`;
-    slots.push({ base_date: bd, base_time: bt });
+  let anchor = new Date(d);
+
+  if (m >= 40) { anchor.setMinutes(30, 0, 0); }
+  else if (m >= 10) { anchor.setMinutes(0, 0, 0); }
+  else { anchor = new Date(anchor.getTime() - 60*60*1000); anchor.setMinutes(30, 0, 0); }
+
+  const out: Array<{base_date:string;base_time:string}> = [];
+  for (let i=0; i<depth; i++) {
+    const t = new Date(anchor.getTime() - i * 30*60*1000);
+    out.push({ base_date: yyyymmdd(t), base_time: `${pad2(t.getHours())}${pad2(t.getMinutes())}` });
   }
-  return slots;
+  return out;
 }
 
-// ---- Influx ----
+// ---------- Influx ----------
 async function writeLP(lines: string[]) {
   if (!lines.length) return;
   const url = `${need('INFLUX_URL')}/api/v2/write?org=${encodeURIComponent(need('INFLUX_ORG'))}&bucket=${encodeURIComponent(need('INFLUX_BUCKET'))}&precision=s`;
@@ -66,8 +70,8 @@ async function writeLP(lines: string[]) {
   if (!res.ok) throw new Error(`Influx write ${res.status}: ${await res.text().catch(()=>"...")}`);
 }
 
-// ---- KMA JSON caller (typ02 → typ01 fallback) ----
-async function callKMAJSON(fullPath: string, params: Record<string,string>) {
+// ---------- KMA JSON (typ02 → typ01) ----------
+async function callKMAJSON(params: Record<string,string>) {
   const base = need('APIHUB_BASE').replace(/\/+$/, '');
   const sp = new URLSearchParams({
     dataType: 'JSON', numOfRows: '1000', pageNo: '1',
@@ -97,13 +101,12 @@ async function callKMAJSON(fullPath: string, params: Record<string,string>) {
     }
   }
 
-  // typ02 → typ01 순차 시도
   let out = await tryUrl(`${base}/api/typ02/openApi/VilageFcstInfoService_2.0/getUltraSrtNcst?${sp.toString()}`);
   if (!out.ok) out = await tryUrl(`${base}/api/typ01/openApi/VilageFcstInfoService_2.0/getUltraSrtNcst?${sp.toString()}`);
   return out;
 }
 
-// ---- Feels-like formulas ----
+// ---------- Feels-like ----------
 const c2f = (c:number)=> c*9/5+32; const f2c = (f:number)=> (f-32)*5/9;
 function heatIndexC(tC:number, rh:number): number {
   const T = c2f(tC), R = rh;
@@ -127,13 +130,13 @@ function chooseFeels(tC:number, rh:number, windMs:number) {
   return { method: 'at', value: apparentTempC(tC, rh, windMs) };
 }
 
-// ---- fetch, compute, write ----
+// ---------- fetch, compute, write ----------
 async function fetchUltraNcst(nx:string, ny:string) {
-  const slots = ncstBaseCandidates();
+  const slots = halfHourAnchors(undefined, 6); // 최신부터 30분 간격 6개
   let lastErr: any = null;
 
   for (const { base_date, base_time } of slots) {
-    const out = await callKMAJSON('VilageFcstInfoService_2.0/getUltraSrtNcst', { base_date, base_time, nx, ny });
+    const out = await callKMAJSON({ base_date, base_time, nx, ny });
     if (!out.ok || !Array.isArray(out.items) || out.items.length === 0) { lastErr = out; continue; }
 
     let T: number|undefined, RH: number|undefined, W: number|undefined;
@@ -146,11 +149,14 @@ async function fetchUltraNcst(nx:string, ny:string) {
     }
     if (T == null || RH == null || W == null) { lastErr = new Error('Missing T/RH/W'); continue; }
 
-    const iso = toIsoKst(base_date, base_time);
-    const ts  = toEpochSec(iso);
-    return { T, RH, W, base_date, base_time, ts, latency: out.latency };
+    // ts: 기준시각 + 10분(가시화 버킷과 실제 제공 시점을 맞추기 위함)
+    const baseIso = toIsoKst(base_date, base_time);
+    const tsBase = toEpochSec(baseIso);
+    const ts = tsBase + 600; // +10m
+
+    return { T, RH, W, base_date, base_time, ts, latency: out.latency, base_s: tsBase };
   }
-  throw Object.assign(new Error('Ncst empty (all HH00 slots failed)'), { lastErr });
+  throw Object.assign(new Error('Ncst empty (all half-hour slots failed)'), { lastErr });
 }
 
 (async () => {
@@ -169,7 +175,6 @@ async function fetchUltraNcst(nx:string, ny:string) {
     const hi = heatIndexC(r.T!, r.RH!);
     const wc = windChillC(r.T!, r.W!);
     const at = apparentTempC(r.T!, r.RH!, r.W!);
-    const base_s = toEpochSec(toIsoKst(r.base_date, r.base_time));
 
     const tags = `life_index,source=kma-ultra-ncst,loc=${loc},stn=${stn},method=${method}`;
     const fields = [
@@ -180,7 +185,7 @@ async function fetchUltraNcst(nx:string, ny:string) {
       `heat_index_c=${hi.toFixed(2)}`,
       `wind_chill_c=${wc.toFixed(2)}`,
       `apparent_c=${at.toFixed(2)}`,
-      `base_time_s=${base_s}i`
+      `base_time_s=${r.base_s}i`
     ].join(',');
 
     lines.push(`${tags} ${fields} ${r.ts}`);
