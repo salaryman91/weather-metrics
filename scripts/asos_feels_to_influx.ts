@@ -1,171 +1,87 @@
 /**
- * KMAHub ASOS(kma_sfctm2.php) → InfluxDB: 체감온도(Heat Index / Wind Chill)
+ * KMAHub ASOS(kma_sfctm2.php) → 체감온도(Heat Index/Wind Chill) → InfluxDB
  *
- * - 최근 N시간(10분 간격) tm 후보를 단일시각으로 조회
- * - disp/help 4조합 시도: (0,0) → (1,1) → (1,0) → (0,1)
- * - help=1 등에서 데이터가 전부 '# ' 주석으로 나올 때도 파싱(주석에서 데이터 복구)
- * - EUC-KR/UTF-8 자동 디코딩(iconv-lite)
- *
+ * 실행(로컬):  npx ts-node scripts/asos_feels_to_influx.ts
  * ENV:
  *   INFLUX_URL, INFLUX_TOKEN, INFLUX_ORG, INFLUX_BUCKET
  *   APIHUB_BASE=https://apihub.kma.go.kr
  *   APIHUB_KEY=<authKey>
  *   ASOS_STN=108
- *   LOC=seoul (opt)
- *
+ *   LOC=seoul (선택)
  * DEBUG:
- *   PowerShell: $env:DEBUG_ASOS="1"
- *   bash      : DEBUG_ASOS=1
+ *   PowerShell: $env:DEBUG_ASOS = "1"
+ *   Linux/mac : DEBUG_ASOS=1
  */
 
-import * as iconv from "iconv-lite";
-
 type Env = {
-  INFLUX_URL: string;
-  INFLUX_TOKEN: string;
-  INFLUX_ORG: string;
-  INFLUX_BUCKET: string;
-  APIHUB_BASE: string;
-  APIHUB_KEY: string;
-  ASOS_STN?: string;
-  LOC?: string;
+  INFLUX_URL: string; INFLUX_TOKEN: string; INFLUX_ORG: string; INFLUX_BUCKET: string;
+  APIHUB_BASE: string; APIHUB_KEY: string; ASOS_STN?: string; LOC?: string;
 };
 const env = process.env as unknown as Env;
 const need = (k: keyof Env) => { const v = env[k]; if (!v) throw new Error(`Missing env: ${k}`); return v; };
 const DBG = !!process.env.DEBUG_ASOS;
 
-/* -------------------- 공통 유틸 -------------------- */
-
-function toLines(t: string) {
-  return t.replace(/\ufeff/g, "")
-    .split(/\r?\n/)
-    .map(s => s.replace(/\s+$/,""))
-    .filter(l => l.trim().length > 0);
-}
-
+/* ---------- 유틸 ---------- */
 function splitCSVLine(line: string): string[] {
   const out: string[] = []; let cur = ""; let q = false;
   for (let i=0;i<line.length;i++){
     const c=line[i];
-    if (c === '"') {
-      if (q && line[i+1] === '"') { cur += '"'; i++; }
-      else q = !q;
-    } else if (c === "," && !q) { out.push(cur); cur=""; }
+    if (c === '"') { if (q && line[i+1] === '"'){ cur+='"'; i++; } else q = !q; }
+    else if (c === "," && !q) { out.push(cur); cur = ""; }
     else cur += c;
   }
   out.push(cur);
-  return out.map(s => s.trim());
+  return out.map(s=>s.trim());
 }
+const toLines = (t: string) =>
+  t.replace(/\ufeff/g,"").split(/\r?\n/).map(s=>s.replace(/\s+$/,"")).filter(l=>l.trim().length>0);
+function splitBy(line: string, mode: "csv"|"ws"){ const s=line.replace(/^#\s*/,"").trim(); return mode==="csv"? splitCSVLine(s) : s.split(/\s+/); }
+function toNum(s?: string){ const n=parseFloat(String(s??"").replace(/,/g,"")); return !isFinite(n) || n <= -8.9 ? NaN : n; }
 
-function splitBy(line: string, mode: "csv" | "ws") {
-  const s = line.replace(/^#\s*/, "").trim();
-  return mode === "csv" ? splitCSVLine(s) : s.split(/\s+/);
-}
-
-function toNum(s?: string) {
-  const n = parseFloat(String(s ?? "").replace(/,/g,""));
-  // -9/-999 등 결측 → NaN
-  return !isFinite(n) || n <= -8.9 ? NaN : n;
-}
-
-async function decodeKR(res: Response): Promise<string> {
-  const ab = await res.arrayBuffer();
-  const buf = Buffer.from(ab);
-  const ct = (res.headers.get("content-type") || "").toLowerCase();
-  if (/euc-?kr|ks_c_5601|cp949/.test(ct)) return iconv.decode(buf, "euc-kr");
-  if (/utf-?8/.test(ct)) return buf.toString("utf8");
-  const utf = buf.toString("utf8");
-  if (utf.includes("\uFFFD")) return iconv.decode(buf, "euc-kr");
-  return utf;
-}
-
-/* -------------------- 시간 후보(KST, 10분 단위) -------------------- */
-
-function kstNow() { return new Date(Date.now() + 9*3600*1000); }
-function fmtKSTYYYYMMDDHHmm(d: Date) {
-  const yyyy = d.getUTCFullYear();
-  const MM   = String(d.getUTCMonth()+1).padStart(2,"0");
-  const dd   = String(d.getUTCDate()).padStart(2,"0");
-  const HH   = String(d.getUTCHours()).padStart(2,"0");
-  const mm   = String(d.getUTCMinutes()).padStart(2,"0");
-  return `${yyyy}${MM}${dd}${HH}${mm}`;
-}
-function tm10Candidates(hours=3): string[] { // ⬅ 2h → 3h 확대
-  const out: string[] = [];
-  const now = kstNow();
-  const base = new Date(now.getTime());
-  base.setUTCSeconds(0,0);
-  base.setUTCMinutes(Math.floor(base.getUTCMinutes()/10)*10); // 10분 바닥
-  for (let i=0;i<=hours*6;i++) {
-    const d = new Date(base.getTime() - i*10*60*1000);
-    out.push(fmtKSTYYYYMMDDHHmm(d));
-  }
-  return out;
-}
-
-/* -------------------- 헤더/데이터 파싱 -------------------- */
-
-function splitHeaderData(all: string[]) {
-  const comments = all.filter(l => l.trim().startsWith("#"));
-  const rest     = all.filter(l => !l.trim().startsWith("#"));
-  return { comments, rest };
-}
-
-/** 코멘트(#) 또는 데이터영역에 존재하는 헤더 토큰 찾기
- *  - 핵심 토큰(TM, TA, RH/REH/HM, WS/WSD) 포함
- *  - 데이터 행 길이(rowLen)와 토큰 수가 일치해야 신뢰
- */
-function headerTokensAny(comments: string[], rest: string[], rowLen: number): string[] | null {
-  const isGood = (arr: string[]) =>
-    /(TM|TIME|DATE)/i.test(arr.join(" ")) &&
-    /(TA|TEMP|기온)/i.test(arr.join(" ")) &&
-    /(HM|REH|RH|습도)/i.test(arr.join(" ")) &&
-    /(WS|WSD|WIND|풍속)/i.test(arr.join(" "));
-
-  // 1) 코멘트에서 검색(길이 일치 우선)
-  const commentSorted = [...comments].sort((a,b)=>b.length-a.length);
-  for (const line of commentSorted) {
-    const s = line.replace(/^#\s*/, "").trim();
-    const csv = s.includes(",") ? s.split(",").map(t=>t.trim()).filter(Boolean) : [];
-    const ws  = s.split(/\s+/);
-    if (csv.length === rowLen && isGood(csv)) return csv;
-    if (ws.length  === rowLen && isGood(ws))  return ws;
-  }
-
-  // 2) 데이터 영역의 "비숫자" 헤더 라인 후보 (앞쪽 6줄 내)
-  const maxCheck = Math.min(6, rest.length);
-  for (let i=0; i<maxCheck; i++){
-    const line = rest[i];
-    if (!/[A-Za-z가-힣]/.test(line)) continue;
-    const csv = line.includes(",") ? line.split(",").map(t=>t.trim()).filter(Boolean) : [];
-    const ws  = line.split(/\s+/);
-    if (csv.length === rowLen && isGood(csv)) return csv;
-    if (ws.length  === rowLen && isGood(ws))  return ws;
+function parseKST12(raw: string): number | null {
+  if (/^\d{12,14}$/.test(raw)) {
+    const yyyy=raw.slice(0,4), MM=raw.slice(4,6), dd=raw.slice(6,8), HH=raw.slice(8,10), mm=raw.slice(10,12), ss=(raw.slice(12,14)||"00");
+    const iso = `${yyyy}-${MM}-${dd}T${HH}:${mm}:${ss}+09:00`;
+    const d = new Date(iso); if (!isNaN(d.getTime())) return Math.floor(d.getTime()/1000);
   }
   return null;
 }
-
-function idxByName(toks: string[]|null, re: RegExp): number {
-  if (!toks) return -1;
-  return toks.findIndex(t => re.test(t));
+function median(a:number[]){ if(!a.length) return NaN; const b=[...a].sort((x,y)=>x-y); const m=Math.floor(b.length/2); return b.length%2? b[m] : (b[m-1]+b[m])/2; }
+function bestIndex(rows:number[][], ok:(v:number)=>boolean, score?:(vals:number[])=>number){
+  const cols=rows[0]?.length ?? 0; let best=-1, s=-1;
+  for(let c=0;c<cols;c++){
+    const vals=rows.map(r=>r[c]).filter(isFinite); if(!vals.length) continue;
+    const okCnt=vals.filter(ok).length; if(okCnt===0) continue;
+    const sc = score? score(vals) : okCnt;
+    if (sc > s){ s=sc; best=c; }
+  }
+  return best;
 }
 
-/* -------------------- 체감온도 -------------------- */
-function heatIndexC(tC: number, rh: number): number {
-  const T = tC * 9/5 + 32, R = rh;
-  const HI = -42.379 + 2.04901523*T + 10.14333127*R - 0.22475541*T*R
-           - 6.83783e-3*T*T - 5.481717e-2*R*R + 1.22874e-3*T*T*R
-           + 8.5282e-4*T*R*R - 1.99e-6*T*T*R*R;
-  return (HI - 32) * 5/9;
+/* ---------- 체감온도 ---------- */
+// Rothfusz °F → °C
+function heatIndexC(tC:number, rh:number){
+  const T=tC*9/5+32, R=rh;
+  const HI=-42.379+2.04901523*T+10.14333127*R-0.22475541*T*R
+          -0.00683783*T*T -0.05481717*R*R +0.00122874*T*T*R
+          +0.00085282*T*R*R -0.00000199*T*T*R*R;
+  return (HI-32)*5/9;
 }
-function windChillC(tC: number, vMs: number): number {
-  const v = vMs * 3.6; // km/h
-  if (tC > 10 || v <= 4.8) return tC;
+// Wind Chill (C, m/s → km/h)
+function windChillC(tC:number, vMs:number){
+  const v=vMs*3.6; if (tC>10 || v<=4.8) return tC;
   return 13.12 + 0.6215*tC - 11.37*Math.pow(v,0.16) + 0.3965*tC*Math.pow(v,0.16);
 }
+// Magnus식 RH from T/Td
+function rhFromTd(tC:number, tdC:number){
+  const a=17.625, b=243.04;
+  const gamma = (a*tdC)/(b+tdC) - (a*tC)/(b+tC);
+  const rh = 100 * Math.exp(gamma);
+  return Math.max(0, Math.min(100, rh));
+}
 
-/* -------------------- Influx -------------------- */
-async function writeLP(lines: string[]) {
+/* ---------- Influx ---------- */
+async function writeLP(lines: string[]){
   const url = `${need("INFLUX_URL")}/api/v2/write?org=${encodeURIComponent(need("INFLUX_ORG"))}&bucket=${encodeURIComponent(need("INFLUX_BUCKET"))}&precision=s`;
   const res = await fetch(url, {
     method:"POST",
@@ -175,106 +91,121 @@ async function writeLP(lines: string[]) {
   if (!res.ok) throw new Error(`Influx write ${res.status}: ${await res.text()}`);
 }
 
-/* -------------------- 수집 핵심 -------------------- */
-
-function buildRowsFrom(bodyLines: string[]) {
-  const mode: "csv"|"ws" = bodyLines.some(l => l.includes(",")) ? "csv" : "ws";
-  const rowsS = bodyLines.map(l => splitBy(l, mode)).filter(r => r.length >= 5);
-  const rowsN = rowsS.map(r => r.map(toNum));
-  return { mode, rowsS, rowsN };
-}
-
-async function tryFetchOne(stn: string, tm: string, disp: 0|1, help: 0|1) {
-  const base = need("APIHUB_BASE");
-  const key  = need("APIHUB_KEY");
-  const url  = `${base}/api/typ01/url/kma_sfctm2.php?stn=${stn}&tm=${tm}&disp=${disp}&help=${help}&authKey=${key}`;
-
-  const t0 = Date.now();
-  const res  = await fetch(url);
-  const text = await decodeKR(res);
-  const latency = Date.now() - t0;
-
-  if (!res.ok) return { ok:false as const, why:`HTTP ${res.status}`, latency };
-
-  const raw = toLines(text);
-  const { comments, rest } = splitHeaderData(raw);
-
-  // 본문이 비면(=모두 코멘트로 온 케이스), 코멘트에서 데이터라인 복구
-  let body = rest;
-  if (body.length === 0) {
-    body = comments
-      .map(l => l.replace(/^#\s*/,""))
-      .filter(l => /\d{8,}/.test(l)); // 시간/수치가 들어간 라인만
+/* ---------- 헤더 토큰 ---------- */
+function headerTokens(commentLines: string[], rowLen: number): string[] | null {
+  for (const line of commentLines) {
+    const s=line.replace(/^#\s*/,"").trim();
+    if (!/(TM|TIME|DATE)/i.test(s)) continue;
+    if (!/(TA|TEMP|기온)/i.test(s)) continue;
+    if (!/(HM|REH|RH|습도)/i.test(s)) continue;
+    if (!/(WS|WSD|WIND|풍속)/i.test(s)) continue;
+    const toks=s.split(/\s+/);
+    if (toks.length===rowLen) return toks;
   }
-  if (body.length === 0) return { ok:false as const, why:"no data rows", latency };
+  return null;
+}
+function idxByName(toks:string[]|null, re:RegExp){ return toks ? toks.findIndex(t=>re.test(t)) : -1; }
 
-  const { rowsS, rowsN } = buildRowsFrom(body);
-  if (rowsS.length === 0) return { ok:false as const, why:"no data rows(after build)", latency };
+/* ---------- ASOS 수집 & 파싱 ---------- */
+async function fetchLatestASOS(stn: string){
+  const now=new Date();
+  const tm2 = now.toISOString().replace(/[-:]/g,"").slice(0,12)+"00";
+  const tm1 = new Date(now.getTime()-3*3600*1000).toISOString().replace(/[-:]/g,"").slice(0,12)+"00";
 
-  const rowS = rowsS.at(-1)!;
-  const rowN = rowsN.at(-1)!;
+  const base=need("APIHUB_BASE");
+  const url = `${base}/api/typ01/url/kma_sfctm2.php?stn=${encodeURIComponent(stn)}&tm1=${tm1}&tm2=${tm2}&disp=1&help=1&authKey=${encodeURIComponent(need("APIHUB_KEY"))}`;
 
-  // 헤더 토큰(코멘트+본문 모두 탐색)
-  const toks = headerTokensAny(comments, body, rowS.length);
+  const t0=Date.now();
+  const res=await fetch(url);
+  const latency=Date.now()-t0;
+  const text=await res.text();
+  if (!res.ok) throw new Error(`ASOS ${res.status}: ${text.slice(0,200)}`);
 
-  // 인덱스 매핑(명칭 확장)
-  const iTA = idxByName(toks, /^(TA|TEMP|기온)$/i);
-  const iHM = idxByName(toks, /^(HM|REH|RH|습도)$/i);
-  const iWS = idxByName(toks, /^(WS|WSD|WIND|풍속)$/i);
+  const lines=toLines(text);
+  const comments=lines.filter(l=>l.startsWith("#"));
+  const data=lines.filter(l=>!l.startsWith("#"));
+  if (!data.length) throw new Error("ASOS: no data rows");
+
+  const mode: "csv"|"ws" = data[0].includes(",") ? "csv" : "ws";
+  const rowsS = data.map(l=>splitBy(l, mode)).filter(r=>r.length>=5);
+  const rowsN: number[][] = rowsS.map(r=>r.map(toNum));
+  const toks = headerTokens(comments, rowsS[0].length);
+
+  // 1차: 이름 매칭
+  let iTM = idxByName(toks, /^(TM|YYMMDDHHMI|DATE|TIME)$/i);
+  let iTA = idxByName(toks, /^(TA|TEMP|기온)$/i);
+  let iHM = idxByName(toks, /^(HM|REH|RH|습도)$/i);
+  let iWS = idxByName(toks, /^(WS|WSD|WIND|풍속)$/i);
+  let iTD = idxByName(toks, /^(TD|DEW|이슬점)$/i);
+
+  // 2차: 분포 기반 보정
+  const preferRH = (vals:number[]) => median(vals); // RH는 보통 중앙값이 큼
+  if (iTA<0) iTA = bestIndex(rowsN, v=>v>-50 && v<50);
+  if (iWS<0) iWS = bestIndex(rowsN, v=>v>=0 && v<=60, vals=>vals.filter(v=>v>1.0).length);
+  if (iHM<0) iHM = bestIndex(rowsN, v=>v>=0 && v<=100, preferRH);
+  if (iTM<0){ const last=rowsS.at(-1)!; iTM = last.findIndex(v=>/^\d{12,14}$/.test(String(v))); }
+  if (iTD<0){ // Td는 온도와 같은 범위
+    iTD = bestIndex(rowsN, v=>v>-50 && v<50, vals => -median(vals)); // Td는 보통 TA보다 낮음 → 중앙값 작은 열을 선호
+  }
 
   if (DBG) {
-    console.log("ASOS url=", url.replace(key, "***"));
-    console.log("header source:", toks ? "FOUND" : "NOT FOUND");
-    if (toks) console.log("tokens:", toks);
-    console.log("idx TA/HM/WS:", iTA, iHM, iWS);
-    console.log("sample row:", rowS.slice(0, 24));
+    console.log("TOKS:", toks);
+    console.log("IDX iTM/iTA/iHM/iWS/iTD:", iTM, iTA, iHM, iWS, iTD);
+    console.log("SAMPLE(last):", rowsS.at(-1));
   }
 
-  if (iTA < 0 || iHM < 0 || iWS < 0) {
-    return { ok:false as const, why:"header not matched", latency };
-  }
+  if (iTA<0 || iWS<0) throw new Error("Required columns not found (TA/WS)");
 
-  const tC = rowN[iTA], rh = rowN[iHM], wMs = rowN[iWS];
+  // 최신 유효행 역탐색
+  for (let k=rowsS.length-1; k>=0; k--){
+    const raw=rowsS[k], num=rowsN[k];
+    const tC = num[iTA], wMs = num[iWS];
+    if (!isFinite(tC) || !isFinite(wMs)) continue;
 
-  // 값 검증
-  if (!(isFinite(tC) && tC > -60 && tC < 60))  return { ok:false as const, why:`bad TA ${tC}`, latency };
-  if (!(isFinite(rh) && rh >= 0 && rh <= 100)) return { ok:false as const, why:`bad RH ${rh}`, latency };
-  if (!(isFinite(wMs) && wMs >= 0 && wMs <= 60)) return { ok:false as const, why:`bad WS ${wMs}`, latency };
+    // RH 우선 얻기
+    let rh = isFinite(num[iHM]) ? num[iHM] : NaN;
 
-  // 체감 계산
-  const feels =
-    (tC >= 27 && rh >= 40) ? heatIndexC(tC, rh)
-  : (tC <= 10 && wMs > 1.34) ? windChillC(tC, wMs)
-  : tC;
-
-  // tm → KST epoch
-  const yyyy = tm.slice(0,4), MM=tm.slice(4,6), dd=tm.slice(6,8), HH=tm.slice(8,10), mm=tm.slice(10,12);
-  const d = new Date(`${yyyy}-${MM}-${dd}T${HH}:${mm}:00+09:00`);
-  const ts = Math.floor(d.getTime()/1000);
-
-  if (DBG) console.log({ tm, picked: { tC, rh, wMs, feels:+feels.toFixed(2) }, ts, latency });
-
-  return { ok:true as const, tC, rh, wMs, feels, ts, latency };
-}
-
-async function fetchLatestASOS(stn: string) {
-  const tms = tm10Candidates(3); // 최근 3h
-  const variants: Array<[0|1,0|1]> = [[0,0],[1,1],[1,0],[0,1]]; // ⬅ 조합 확대
-
-  let lastErr = "no candidate worked";
-  for (const tm of tms) {
-    for (const [disp,help] of variants) {
-      const r = await tryFetchOne(stn, tm, disp, help);
-      if (r.ok) return r;
-      lastErr = `${r.why} @tm=${tm}, disp=${disp}, help=${help}`;
-      if (DBG) console.log("skip:", lastErr);
+    // Td 기반 RH 대체 후보
+    let rhTd = NaN;
+    if (iTD>=0 && isFinite(num[iTD])) {
+      const td=num[iTD];
+      if (isFinite(td)) rhTd = rhFromTd(tC, td);
     }
+
+    // 따뜻한 시간에서 RH가 말이 안 되면(T>=18 & RH<20) Td기반으로 대체
+    if ((tC>=18 && (!isFinite(rh) || rh<20 || rh>100)) && isFinite(rhTd)) rh = rhTd;
+
+    // 범위 클램프
+    if (!isFinite(rh) || rh<0 || rh>100) continue;
+
+    // 시각
+    let ts = Math.floor(Date.now()/1000);
+    if (iTM>=0){ const t=parseKST12(String(raw[iTM]??"")); if (t) ts=t; }
+
+    // 체감온도 계산
+    let feels = (tC>=27 && rh>=40) ? heatIndexC(tC, rh)
+              : (tC<=10 && wMs>1.34) ? windChillC(tC, wMs)
+              : tC;
+
+    // 품질 가드: 비상식이면 Td 기반으로 재시도
+    if (Math.abs(feels - tC) > 12 && isFinite(rhTd)) {
+      const feels2 = (tC>=27 && rhTd>=40) ? heatIndexC(tC, rhTd)
+                    : (tC<=10 && wMs>1.34) ? windChillC(tC, wMs)
+                    : tC;
+      if (Math.abs(feels2 - tC) < Math.abs(feels - tC)) {
+        if (DBG) console.log("Recalc feels with Td-based RH:", { old:feels, new:feels2, rhOld:rh, rhTd });
+        rh = rhTd; feels = feels2;
+      }
+    }
+
+    if (DBG) console.log({ pickedRow: raw, idx:{iTM,iTA,iHM,iWS,iTD}, vals:{tC, rh, wMs, feels:+feels.toFixed(2)} });
+    return { tC, rh, wMs, feels, ts, latency };
   }
-  throw new Error(`ASOS fetch failed: ${lastErr}`);
+
+  throw new Error("ASOS: no valid row after scanning");
 }
 
-/* -------------------- main -------------------- */
-
+/* ---------- main ---------- */
 (async () => {
   const stn = (env.ASOS_STN || "108").trim();
   const loc = env.LOC || "seoul";
@@ -283,11 +214,11 @@ async function fetchLatestASOS(stn: string) {
 
   const now = Math.floor(Date.now()/1000);
   const lines = [
-    `life_index,source=kmahub-asos,loc=${loc},stn=${stn} feels_c=${+feels.toFixed(2)},temp_c=${tC},rh_pct=${rh},wind_ms=${wMs} ${ts}`,
-    `api_probe,service=asos_feels,env=prod,loc=${loc} success=1i,latency_ms=${latency}i ${now}`
+    `life_index,source=kmahub-asos,loc=${loc},stn=${stn} temp_c=${tC},rh_pct=${rh},wind_ms=${wMs},feels_c=${+feels.toFixed(2)} ${ts}`,
+    `api_probe,service=asos_feels,env=prod,loc=${loc} success=1i,latency_ms=${latency}i ${now}`,
   ];
   await writeLP(lines);
 
-  console.log(`FeelsLike=${(+feels.toFixed(2))}C, Temp=${tC}C, RH=${rh}%, Wind=${wMs}m/s @ stn=${stn}`);
+  console.log(`FeelsLike=${feels.toFixed(2)}C, Temp=${tC}C, RH=${rh}%, Wind=${wMs}m/s @ stn=${stn}`);
   console.log("Influx write OK");
 })().catch(e => { console.error(e); process.exit(1); });
