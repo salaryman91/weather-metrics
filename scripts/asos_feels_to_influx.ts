@@ -1,10 +1,9 @@
 /**
  * KMAHub ASOS(kma_sfctm2.php) → InfluxDB: 체감온도(Heat Index / Wind Chill)
  *
- * - 최근 2시간(10분 간격) tm 후보를 stn 단일시각으로 조회
- * - disp=0/help=0, disp=1/help=1 모두 시도
- * - 헤더 검출: 코멘트(#) + 데이터영역 모두 탐색(열 수 일치 + 핵심 토큰 포함)
- * - 헤더 미탐지/값 비정상 시 해당 응답 스킵(오기록 방지)
+ * - 최근 N시간(10분 간격) tm 후보를 단일시각으로 조회
+ * - disp/help 4조합 시도: (0,0) → (1,1) → (1,0) → (0,1)
+ * - help=1 등에서 데이터가 전부 '# ' 주석으로 나올 때도 파싱(주석에서 데이터 복구)
  * - EUC-KR/UTF-8 자동 디코딩(iconv-lite)
  *
  * ENV:
@@ -15,7 +14,7 @@
  *   LOC=seoul (opt)
  *
  * DEBUG:
- *   PowerShell: $env:DEBUG_ASOS = "1"
+ *   PowerShell: $env:DEBUG_ASOS="1"
  *   bash      : DEBUG_ASOS=1
  */
 
@@ -91,7 +90,7 @@ function fmtKSTYYYYMMDDHHmm(d: Date) {
   const mm   = String(d.getUTCMinutes()).padStart(2,"0");
   return `${yyyy}${MM}${dd}${HH}${mm}`;
 }
-function tm10Candidates(hours=2): string[] {
+function tm10Candidates(hours=3): string[] { // ⬅ 2h → 3h 확대
   const out: string[] = [];
   const now = kstNow();
   const base = new Date(now.getTime());
@@ -104,7 +103,7 @@ function tm10Candidates(hours=2): string[] {
   return out;
 }
 
-/* -------------------- 헤더 파싱 -------------------- */
+/* -------------------- 헤더/데이터 파싱 -------------------- */
 
 function splitHeaderData(all: string[]) {
   const comments = all.filter(l => l.trim().startsWith("#"));
@@ -133,11 +132,10 @@ function headerTokensAny(comments: string[], rest: string[], rowLen: number): st
     if (ws.length  === rowLen && isGood(ws))  return ws;
   }
 
-  // 2) 데이터 영역의 "비숫자" 헤더 라인 후보 (앞쪽 3~5줄 내에서 주로 등장)
+  // 2) 데이터 영역의 "비숫자" 헤더 라인 후보 (앞쪽 6줄 내)
   const maxCheck = Math.min(6, rest.length);
   for (let i=0; i<maxCheck; i++){
     const line = rest[i];
-    // 글자가 포함되어 있고 숫자/기호만으로 안 이루어진 줄
     if (!/[A-Za-z가-힣]/.test(line)) continue;
     const csv = line.includes(",") ? line.split(",").map(t=>t.trim()).filter(Boolean) : [];
     const ws  = line.split(/\s+/);
@@ -179,6 +177,13 @@ async function writeLP(lines: string[]) {
 
 /* -------------------- 수집 핵심 -------------------- */
 
+function buildRowsFrom(bodyLines: string[]) {
+  const mode: "csv"|"ws" = bodyLines.some(l => l.includes(",")) ? "csv" : "ws";
+  const rowsS = bodyLines.map(l => splitBy(l, mode)).filter(r => r.length >= 5);
+  const rowsN = rowsS.map(r => r.map(toNum));
+  return { mode, rowsS, rowsN };
+}
+
 async function tryFetchOne(stn: string, tm: string, disp: 0|1, help: 0|1) {
   const base = need("APIHUB_BASE");
   const key  = need("APIHUB_KEY");
@@ -193,18 +198,24 @@ async function tryFetchOne(stn: string, tm: string, disp: 0|1, help: 0|1) {
 
   const raw = toLines(text);
   const { comments, rest } = splitHeaderData(raw);
-  if (rest.length === 0) return { ok:false as const, why:"no data rows", latency };
 
-  const mode: "csv"|"ws" = rest[0].includes(",") ? "csv" : "ws";
-  const rowsS = rest.map(l => splitBy(l, mode)).filter(r => r.length >= 5);
-  const rowsN = rowsS.map(r => r.map(toNum));
+  // 본문이 비면(=모두 코멘트로 온 케이스), 코멘트에서 데이터라인 복구
+  let body = rest;
+  if (body.length === 0) {
+    body = comments
+      .map(l => l.replace(/^#\s*/,""))
+      .filter(l => /\d{8,}/.test(l)); // 시간/수치가 들어간 라인만
+  }
+  if (body.length === 0) return { ok:false as const, why:"no data rows", latency };
 
-  // 최신행 채택
+  const { rowsS, rowsN } = buildRowsFrom(body);
+  if (rowsS.length === 0) return { ok:false as const, why:"no data rows(after build)", latency };
+
   const rowS = rowsS.at(-1)!;
   const rowN = rowsN.at(-1)!;
 
-  // (수정) 코멘트 + 데이터 본문 모두에서 헤더 토큰 탐색
-  const toks = headerTokensAny(comments, rest, rowS.length);
+  // 헤더 토큰(코멘트+본문 모두 탐색)
+  const toks = headerTokensAny(comments, body, rowS.length);
 
   // 인덱스 매핑(명칭 확장)
   const iTA = idxByName(toks, /^(TA|TEMP|기온)$/i);
@@ -219,7 +230,6 @@ async function tryFetchOne(stn: string, tm: string, disp: 0|1, help: 0|1) {
     console.log("sample row:", rowS.slice(0, 24));
   }
 
-  // 헤더 매핑 실패 → 이 응답은 사용하지 않음
   if (iTA < 0 || iHM < 0 || iWS < 0) {
     return { ok:false as const, why:"header not matched", latency };
   }
@@ -227,7 +237,7 @@ async function tryFetchOne(stn: string, tm: string, disp: 0|1, help: 0|1) {
   const tC = rowN[iTA], rh = rowN[iHM], wMs = rowN[iWS];
 
   // 값 검증
-  if (!(isFinite(tC) && tC > -60 && tC < 60)) return { ok:false as const, why:`bad TA ${tC}`, latency };
+  if (!(isFinite(tC) && tC > -60 && tC < 60))  return { ok:false as const, why:`bad TA ${tC}`, latency };
   if (!(isFinite(rh) && rh >= 0 && rh <= 100)) return { ok:false as const, why:`bad RH ${rh}`, latency };
   if (!(isFinite(wMs) && wMs >= 0 && wMs <= 60)) return { ok:false as const, why:`bad WS ${wMs}`, latency };
 
@@ -248,8 +258,8 @@ async function tryFetchOne(stn: string, tm: string, disp: 0|1, help: 0|1) {
 }
 
 async function fetchLatestASOS(stn: string) {
-  const tms = tm10Candidates(2); // 최근 2시간(10분 간격)
-  const variants: Array<[0|1,0|1]> = [[0,0],[1,1]];
+  const tms = tm10Candidates(3); // 최근 3h
+  const variants: Array<[0|1,0|1]> = [[0,0],[1,1],[1,0],[0,1]]; // ⬅ 조합 확대
 
   let lastErr = "no candidate worked";
   for (const tm of tms) {
