@@ -1,11 +1,10 @@
 /**
  * KMAHub ASOS(kma_sfctm2.php) → InfluxDB: 체감온도(Heat Index / Wind Chill)
  *
- * 전략
- * - 최근 2시간 KST 기준, 10분 단위 tm 후보를 생성해 stn 단일시각 응답을 우선 조회
- * - disp=0/help=0, disp=1/help=1 두 가지 포맷을 모두 시도
- * - 코멘트 헤더에서 TA / (HM|REH|RH) / (WS|WSD) 인덱스를 "정확히" 찾을 때만 채택
- * - 헤더 미탐지/값 비정상 시, 해당 응답은 스킵하고 다음 후보로 진행(오기록 방지)
+ * - 최근 2시간(10분 간격) tm 후보를 stn 단일시각으로 조회
+ * - disp=0/help=0, disp=1/help=1 모두 시도
+ * - 헤더 검출: 코멘트(#) + 데이터영역 모두 탐색(열 수 일치 + 핵심 토큰 포함)
+ * - 헤더 미탐지/값 비정상 시 해당 응답 스킵(오기록 방지)
  * - EUC-KR/UTF-8 자동 디코딩(iconv-lite)
  *
  * ENV:
@@ -33,9 +32,7 @@ type Env = {
   LOC?: string;
 };
 const env = process.env as unknown as Env;
-const need = (k: keyof Env) => {
-  const v = env[k]; if (!v) throw new Error(`Missing env: ${k}`); return v;
-};
+const need = (k: keyof Env) => { const v = env[k]; if (!v) throw new Error(`Missing env: ${k}`); return v; };
 const DBG = !!process.env.DEBUG_ASOS;
 
 /* -------------------- 공통 유틸 -------------------- */
@@ -85,9 +82,7 @@ async function decodeKR(res: Response): Promise<string> {
 
 /* -------------------- 시간 후보(KST, 10분 단위) -------------------- */
 
-function kstNow() {
-  return new Date(Date.now() + 9*3600*1000);
-}
+function kstNow() { return new Date(Date.now() + 9*3600*1000); }
 function fmtKSTYYYYMMDDHHmm(d: Date) {
   const yyyy = d.getUTCFullYear();
   const MM   = String(d.getUTCMonth()+1).padStart(2,"0");
@@ -117,24 +112,37 @@ function splitHeaderData(all: string[]) {
   return { comments, rest };
 }
 
-/** 코멘트 헤더에서 실제 데이터 열 갯수와 동일한 "토큰 라인"을 찾아 반환 */
-function headerTokens(comments: string[], rowLen: number): string[] | null {
-  // 가장 긴 후보 라인부터 검사
-  const sorted = [...comments].sort((a,b)=>b.length-a.length);
-  for (const line of sorted) {
+/** 코멘트(#) 또는 데이터영역에 존재하는 헤더 토큰 찾기
+ *  - 핵심 토큰(TM, TA, RH/REH/HM, WS/WSD) 포함
+ *  - 데이터 행 길이(rowLen)와 토큰 수가 일치해야 신뢰
+ */
+function headerTokensAny(comments: string[], rest: string[], rowLen: number): string[] | null {
+  const isGood = (arr: string[]) =>
+    /(TM|TIME|DATE)/i.test(arr.join(" ")) &&
+    /(TA|TEMP|기온)/i.test(arr.join(" ")) &&
+    /(HM|REH|RH|습도)/i.test(arr.join(" ")) &&
+    /(WS|WSD|WIND|풍속)/i.test(arr.join(" "));
+
+  // 1) 코멘트에서 검색(길이 일치 우선)
+  const commentSorted = [...comments].sort((a,b)=>b.length-a.length);
+  for (const line of commentSorted) {
     const s = line.replace(/^#\s*/, "").trim();
-    // 핵심 키워드 모두 존재해야 함
-    if (!/(TM|TIME|DATE)/i.test(s)) continue;
-    if (!/(TA|TEMP|기온)/i.test(s)) continue;
-    if (!/(HM|REH|RH|습도)/i.test(s)) continue;
-    if (!/(WS|WSD|WIND|풍속)/i.test(s)) continue;
-    // 콤마/공백 분할 시도
-    const toksCsv = s.split(",").map(x=>x.trim()).filter(Boolean);
-    const csvOK = toksCsv.length === rowLen;
-    const toksWs  = s.split(/\s+/);
-    const wsOK  = toksWs.length === rowLen;
-    if (csvOK) return toksCsv;
-    if (wsOK)  return toksWs;
+    const csv = s.includes(",") ? s.split(",").map(t=>t.trim()).filter(Boolean) : [];
+    const ws  = s.split(/\s+/);
+    if (csv.length === rowLen && isGood(csv)) return csv;
+    if (ws.length  === rowLen && isGood(ws))  return ws;
+  }
+
+  // 2) 데이터 영역의 "비숫자" 헤더 라인 후보 (앞쪽 3~5줄 내에서 주로 등장)
+  const maxCheck = Math.min(6, rest.length);
+  for (let i=0; i<maxCheck; i++){
+    const line = rest[i];
+    // 글자가 포함되어 있고 숫자/기호만으로 안 이루어진 줄
+    if (!/[A-Za-z가-힣]/.test(line)) continue;
+    const csv = line.includes(",") ? line.split(",").map(t=>t.trim()).filter(Boolean) : [];
+    const ws  = line.split(/\s+/);
+    if (csv.length === rowLen && isGood(csv)) return csv;
+    if (ws.length  === rowLen && isGood(ws))  return ws;
   }
   return null;
 }
@@ -191,20 +199,24 @@ async function tryFetchOne(stn: string, tm: string, disp: 0|1, help: 0|1) {
   const rowsS = rest.map(l => splitBy(l, mode)).filter(r => r.length >= 5);
   const rowsN = rowsS.map(r => r.map(toNum));
 
-  // 단일 시각 응답이어도 간혹 여러 줄이 있을 수 있어 최신(마지막) 채택
+  // 최신행 채택
   const rowS = rowsS.at(-1)!;
   const rowN = rowsN.at(-1)!;
 
-  const toks = headerTokens(comments, rowS.length);
-  const iTA  = idxByName(toks, /^(TA|TEMP|기온)$/i);
-  const iHM  = idxByName(toks, /^(HM|REH|RH|습도)$/i);
-  const iWS  = idxByName(toks, /^(WS|WSD|WIND|풍속)$/i);
+  // (수정) 코멘트 + 데이터 본문 모두에서 헤더 토큰 탐색
+  const toks = headerTokensAny(comments, rest, rowS.length);
+
+  // 인덱스 매핑(명칭 확장)
+  const iTA = idxByName(toks, /^(TA|TEMP|기온)$/i);
+  const iHM = idxByName(toks, /^(HM|REH|RH|습도)$/i);
+  const iWS = idxByName(toks, /^(WS|WSD|WIND|풍속)$/i);
 
   if (DBG) {
     console.log("ASOS url=", url.replace(key, "***"));
-    console.log("header tokens? ", !!toks, toks || "(none)");
+    console.log("header source:", toks ? "FOUND" : "NOT FOUND");
+    if (toks) console.log("tokens:", toks);
     console.log("idx TA/HM/WS:", iTA, iHM, iWS);
-    console.log("sample row:", rowS.slice(0, 16)); // 너무 길면 앞부분만
+    console.log("sample row:", rowS.slice(0, 24));
   }
 
   // 헤더 매핑 실패 → 이 응답은 사용하지 않음
@@ -237,9 +249,7 @@ async function tryFetchOne(stn: string, tm: string, disp: 0|1, help: 0|1) {
 
 async function fetchLatestASOS(stn: string) {
   const tms = tm10Candidates(2); // 최근 2시간(10분 간격)
-  const variants: Array<[0|1,0|1]> = [
-    [0,0], [1,1]
-  ];
+  const variants: Array<[0|1,0|1]> = [[0,0],[1,1]];
 
   let lastErr = "no candidate worked";
   for (const tm of tms) {
