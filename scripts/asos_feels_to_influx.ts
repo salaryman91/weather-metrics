@@ -9,8 +9,6 @@
  *   APIHUB_KEY=<authKey>
  *   ASOS_STN=108 (예: 서울)
  *   LOC=seoul (선택)
- *
- * 주의: 콘솔 로그에 authKey를 절대 출력하지 않습니다.
  */
 
 import iconv from "iconv-lite";
@@ -71,18 +69,15 @@ const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v
 
 // ---------- 열지수/바람차가 체감 ----------
 function apparentTempC(tC: number, rh: number, vMs: number): number {
-  // Australian Bureau of Meteorology AT 공식:
-  // AT = T + 0.33*e - 0.70*ws - 4, e(hPa)=RH/100*6.105*exp(17.27*T/(237.7+T))
+  // Australian Bureau of Meteorology AT 공식
   const e = (rh / 100) * 6.105 * Math.exp((17.27 * tC) / (237.7 + tC));
   return tC + 0.33 * e - 0.70 * vMs - 4;
 }
-
 function windChillC(tC: number, vMs: number): number {
   const v = vMs * 3.6; // km/h
   if (tC > 10 || v <= 4.8) return tC;
   return 13.12 + 0.6215 * tC - 11.37 * Math.pow(v, 0.16) + 0.3965 * tC * Math.pow(v, 0.16);
 }
-
 // TD→RH (Magnus)
 function rhFromTD(tC: number, tdC: number): number {
   const a = 17.625, b = 243.04;
@@ -98,7 +93,6 @@ async function writeLP(lines: string[]): Promise<void> {
     + `?org=${encodeURIComponent(need("INFLUX_ORG"))}`
     + `&bucket=${encodeURIComponent(need("INFLUX_BUCKET"))}`
     + `&precision=s`;
-
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -117,9 +111,9 @@ async function writeLP(lines: string[]): Promise<void> {
 type PickedRow = {
   ts: number;       // epoch seconds (KST)
   tC: number;       // 기온
-  rh?: number;      // 상대습도(%)
+  rh: number;       // 상대습도(%)
   td?: number;      // 이슬점(선택)
-  wMs?: number;     // 풍속(m/s)
+  wMs: number;      // 풍속(m/s)
   raw: string[];    // 원행
 };
 
@@ -136,9 +130,7 @@ async function tryFetch(stn: string, opt: FetchOption): Promise<PickedRow | null
     + `?stn=${encodeURIComponent(stn)}&tm1=${tm1}&tm2=${tm2}`
     + `&disp=${opt.disp}&help=${opt.help}&authKey=${encodeURIComponent(need("APIHUB_KEY"))}`;
 
-  const t0 = Date.now();
   const res = await fetch(url);
-  const latency = Date.now() - t0;
   const buf = await res.arrayBuffer();
   if (!res.ok) {
     const head = iconv.decode(Buffer.from(buf).subarray(0, 400), "euc-kr");
@@ -148,22 +140,17 @@ async function tryFetch(stn: string, opt: FetchOption): Promise<PickedRow | null
   const lines = toLinesKR(buf);
   const nonBlank = lines.filter(l => l.trim().length > 0);
 
-  // 원본문에 "자료가 없습니다" 류 메시지 처리
-  if (nonBlank.some(l => /자료.?없|no data/i.test(l))) {
-    if (process.env.DEBUG_ASOS) console.log("[ASOS] empty-range:", nonBlank.slice(0, 8));
-    return null;
-  }
+  // "자료가 없습니다" 등
+  if (nonBlank.some(l => /자료.?없|no data/i.test(l))) return null;
 
-  // 주석 제외
+  // 데이터 라인 추출
   let dataLines = nonBlank.filter(l => !l.trim().startsWith("#"));
-
-  // 도움말만 있고 데이터가 없을 수 있음 → 긴급 완화: 숫자 열이 많은 행만 데이터로 간주
   if (dataLines.length === 0) {
     dataLines = nonBlank.filter(l => (l.match(/[\d\.]/g) || []).length >= 8);
   }
   if (dataLines.length === 0) return null;
 
-  // 헤더 후보(주석 라인에서 찾되, 없으면 데이터 첫 행을 헤더 없이 처리)
+  // 헤더 후보
   const headerLine =
     [...nonBlank].reverse().find((l) =>
       l.trim().startsWith("#") &&
@@ -239,13 +226,16 @@ async function tryFetch(stn: string, opt: FetchOption): Promise<PickedRow | null
     const ws = toNum(r[iWS]);
 
     if (!Number.isFinite(tC) || !(tC > -30 && tC < 45)) continue;
-    let rh = Number.isFinite(hm) ? hm : NaN;
-    if (!(rh >= 10 && rh <= 100) && Number.isFinite(td) && td > -60 && td < 40) {
-      rh = rhFromTD(tC, td);
-    }
-    if (!(rh >= 10 && rh <= 100)) continue;
 
-    const wMs = Number.isFinite(ws) ? clamp(ws, 0, 40) : 0;
+    // RH 확정
+    let rhVal = Number.isFinite(hm) ? hm : NaN;
+    if (!(rhVal >= 10 && rhVal <= 100) && Number.isFinite(td) && td > -60 && td < 40) {
+      rhVal = rhFromTD(tC, td);
+    }
+    if (!(rhVal >= 10 && rhVal <= 100)) continue;
+
+    // 풍속 확정
+    const wMsVal = Number.isFinite(ws) ? clamp(ws, 0, 40) : 0;
 
     // 타임스탬프
     let ts = Math.floor(Date.now() / 1000);
@@ -263,13 +253,16 @@ async function tryFetch(stn: string, opt: FetchOption): Promise<PickedRow | null
       }
     }
 
-    return { ts, tC, rh, td: Number.isFinite(td) ? td : undefined, wMs, raw: r };
+    return {
+      ts,
+      tC,
+      rh: rhVal,
+      td: Number.isFinite(td) ? td : undefined,
+      wMs: wMsVal,
+      raw: r,
+    };
   }
 
-  if (process.env.DEBUG_ASOS) {
-    console.log("[ASOS] could not pick a valid row. header:", header);
-    console.log("[ASOS] sample:", rows.at(-1));
-  }
   return null;
 }
 
@@ -289,14 +282,13 @@ async function fetchLatestASOS(stn: string): Promise<{ tC: number; rh: number; w
     lastLatency = Date.now() - t0;
     if (picked) break;
   }
-
   if (!picked) {
     const e = new Error("ASOS: no data rows");
     (e as any).__latency = lastLatency;
     throw e;
   }
 
-  const { tC, rh, wMs = 0, ts } = picked;
+  const { tC, rh, wMs, ts } = picked;
 
   // 3시간 초과 스테일 가드
   const maxAgeSec = 3 * 3600;
@@ -326,10 +318,8 @@ async function fetchLatestASOS(stn: string): Promise<{ tC: number; rh: number; w
 
     const now = Math.floor(Date.now() / 1000);
     const lines = [
-      // 관측 기반 life_index
       `life_index,source=kmahub-asos,loc=${loc},stn=${stn} ` +
       `feels_c=${feels.toFixed(2)},temp_c=${tC},rh_pct=${rh},wind_ms=${wMs} ${ts}`,
-      // 가용성/지연 프로브
       `api_probe,service=asos_feels,env=prod,loc=${loc} success=1i,latency_ms=${latency}i ${now}`,
     ];
 
@@ -343,14 +333,8 @@ async function fetchLatestASOS(stn: string): Promise<{ tC: number; rh: number; w
 
     // 실패 시에도 잡이 죽지 않게: 실패 상태만 기록
     const probe = `api_probe,service=asos_feels,env=prod,loc=${locTag} success=0i,latency_ms=${latency}i ${now}`;
-    try {
-      await writeLP([probe]);
-    } catch {
-      // 프로브 쓰기 실패는 그냥 로그만
-    }
-
+    try { await writeLP([probe]); } catch {}
     console.error(e);
-    // 잡은 성공 종료(0)하여 스케줄 유지
-    process.exit(0);
+    process.exit(0); // 스케줄 유지
   }
 })();
