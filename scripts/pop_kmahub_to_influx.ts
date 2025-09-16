@@ -1,12 +1,26 @@
 /**
- * POP(강수확률) 스모크: KMA API허브 fct_afs_dl2 → InfluxDB Cloud 적재
- * 실행: npm run dev:pop
- * 필요 .env:
+ * POP(강수확률) 수집: KMA API허브 fct_afs_dl2 → InfluxDB Cloud
+ *
+ * 실행:
+ *   npx ts-node scripts/pop_kmahub_to_influx.ts
+ *
+ * 필요 환경변수(.env 혹은 GitHub Actions env/secrets):
  *   INFLUX_URL, INFLUX_TOKEN, INFLUX_ORG, INFLUX_BUCKET
  *   APIHUB_BASE=https://apihub.kma.go.kr
  *   APIHUB_KEY=<authKey>
- *   POP_REG=<예보구역코드>
+ *   POP_REG=<예보구역코드, 예: 11B10101>
  *   LOC=seoul (선택)
+ *
+ * 스키마(권장/통일):
+ *   _measurement = "pop"
+ *   _field       = "pop_pct"      // float, 0~100 (%)
+ *   tags         = source=kmahub-di2, reg=<...>, loc=<...>
+ *   _time        = 예보 유효시각
+ *
+ * 헬스체크는 별도 측정치:
+ *   _measurement = "api_probe"
+ *   fields       = success(1i), latency_ms(i)
+ *   tags         = service=pop_kmahub, env=prod, loc=<...>
  */
 
 type Env = {
@@ -21,13 +35,13 @@ type Env = {
 };
 
 const env = process.env as unknown as Env;
-const req = (k: keyof Env) => {
+const need = (k: keyof Env) => {
   const v = env[k];
   if (!v) throw new Error(`Missing env: ${k}`);
   return v;
 };
 
-/** CSV 한 줄 안전 분할 (따옴표/이중따옴표 이스케이프 처리) */
+/** CSV 한 줄 안전 분해 (따옴표 이스케이프 대응) */
 function splitCSVLine(line: string): string[] {
   const out: string[] = [];
   let cur = "";
@@ -52,98 +66,127 @@ function splitCSVLine(line: string): string[] {
   return out.map((s) => s.trim());
 }
 
-/** KMAHub 단기 육상예보(구역 단위)에서 POP 1건 가져오기 */
-async function fetchPop(reg: string): Promise<{
-  pop: number;
-  ts: number; // seconds
-  latency: number;
-  url: string;
-}> {
-  // 헤더가 항상 나오도록 help=1로 호출, CSV(disp=1)
+/** 다양한 포맷의 시간 문자열 → epoch(sec) (기본 KST) */
+function parseToEpochSec(raw: string): number | null {
+  const s = raw.trim();
+  if (!s) return null;
+
+  // 1) 20240916 12:00 or 2024-09-16 12:00
+  const norm = s.replace(/(\d{4})[-/.]?(\d{2})[-/.]?(\d{2})[ T]?(\d{2}):?(\d{2})(?::?(\d{2}))?/, "$1-$2-$3T$4:$5:$6");
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?$/.test(norm)) {
+    const withTz = norm.length === 16 ? norm + ":00+09:00" : norm + "+09:00";
+    const d = new Date(withTz);
+    return isNaN(d.getTime()) ? null : Math.floor(d.getTime() / 1000);
+  }
+
+  // 2) 202409161200 (yyyyMMddHHmm) or 20240916120000
+  if (/^\d{12,14}$/.test(s)) {
+    const yyyy = s.slice(0, 4);
+    const MM = s.slice(4, 6);
+    const dd = s.slice(6, 8);
+    const HH = s.slice(8, 10);
+    const mm = s.slice(10, 12);
+    const ss = s.length >= 14 ? s.slice(12, 14) : "00";
+    const iso = `${yyyy}-${MM}-${dd}T${HH}:${mm}:${ss}+09:00`;
+    const d = new Date(iso);
+    return isNaN(d.getTime()) ? null : Math.floor(d.getTime() / 1000);
+  }
+
+  // 3) 이미 타임존 포함 ISO
+  const d = new Date(/\+|Z/.test(s) ? s : s + "+09:00");
+  return isNaN(d.getTime()) ? null : Math.floor(d.getTime() / 1000);
+}
+
+type PopRow = { ts: number; popPct: number; raw: string[] };
+
+/** KMAHub fct_afs_dl2: POP 전체 행 파싱 */
+async function fetchPopRows(reg: string): Promise<{ rows: PopRow[]; latency: number; url: string }> {
   const qs = new URLSearchParams({
     reg,
     tmfc: "0", // 최신 발표 묶음
-    disp: "1",
-    help: "1",
-    authKey: req("APIHUB_KEY"),
+    disp: "1", // CSV
+    help: "1", // 헤더/주석 포함
+    authKey: need("APIHUB_KEY"),
   });
-
-  const url = `${req("APIHUB_BASE")}/api/typ01/url/fct_afs_dl2.php?${qs.toString()}`;
+  const url = `${need("APIHUB_BASE")}/api/typ01/url/fct_afs_dl2.php?${qs.toString()}`;
 
   const t0 = Date.now();
   const res = await fetch(url);
   const latency = Date.now() - t0;
   const text = await res.text();
+  if (!res.ok) throw new Error(`KMAHub ${res.status}: ${text.slice(0, 300)}`);
 
-  if (!res.ok) {
-    throw new Error(`KMAHub ${res.status}: ${text.slice(0, 200)}`);
-  }
-
-  // BOM 제거, 공백/빈줄 제거
   const rawLines = text.replace(/\ufeff/g, "").split(/\r?\n/).filter((l) => l.trim().length > 0);
-  // '#START7777' 같은 메타/주석 라인 제거
   const lines = rawLines.filter((l) => !l.startsWith("#"));
 
-  // 헤더 라인 찾기
-  const looksLikeHeader = (s: string) =>
-    /(^|,)\s*(ST|POP|강수확률)\s*(,|$)/i.test(s) || /(tmef|ftime|time|valid)/i.test(s);
-  let headerIdx = lines.findIndex(looksLikeHeader);
-  if (headerIdx < 0) headerIdx = 0; // 실패 시 첫 줄을 헤더로 가정
+  // 헤더 찾기
+  const looksHeader = (s: string) =>
+    /(^|,)\s*(ST|POP|강수확률)\s*(,|$)/i.test(s) || /(tmef|ftime|tmEf|valid|time|fcst)/i.test(s);
+  let headerIdx = lines.findIndex(looksHeader);
+  if (headerIdx < 0) headerIdx = 0;
 
   const header = splitCSVLine(lines[headerIdx]);
-  const dataRows = lines
-    .slice(headerIdx + 1)
-    .map(splitCSVLine)
-    .filter((r) => r.length >= header.length);
+  const data = lines.slice(headerIdx + 1).map(splitCSVLine).filter((r) => r.length >= header.length);
 
-  // POP 컬럼 찾기(이름 우선, 실패 시 0~100 정수 패턴)
-  let idxPOP = header.findIndex((h) => /^(ST|POP)$/i.test(h) || /강수확률/.test(h));
-  if (idxPOP === -1) {
+  // 컬럼 인덱스 추정
+  let iPOP = header.findIndex((h) => /^(ST|POP)$/i.test(h) || /강수확률/.test(h));
+  if (iPOP < 0) {
+    // 숫자 0~100 패턴 열 탐색
     const cand: number[] = [];
     for (let c = 0; c < header.length; c++) {
-      const ok = dataRows.slice(0, 12).every((r) => /^\d+$/.test(r[c] ?? "") && +r[c] >= 0 && +r[c] <= 100);
+      const ok = data.slice(0, 20).every((r) => /^\d+$/.test(r[c] ?? "") && +r[c] >= 0 && +r[c] <= 100);
       if (ok) cand.push(c);
     }
-    if (cand.length > 0) idxPOP = cand[0];
+    if (cand.length) iPOP = cand[0];
   }
-  if (idxPOP === -1) {
+  const iT = header.findIndex((h) => /(tmef|ftime|tmEf|valid|time|fcst)/i.test(h));
+
+  if (iPOP < 0) {
     console.log("Header:", header);
-    console.log("Sample rows:", dataRows.slice(0, 5));
-    throw new Error("POP column not found (header·패턴 둘 다 실패)");
+    console.log("Sample:", data.slice(0, 5));
+    throw new Error("POP column not found");
   }
 
-  // 시간 컬럼 추정(없으면 현재 시각 사용)
-  const idxT = header.findIndex((h) => /(tmef|ftime|time|valid|fcst)/i.test(h));
+  const rows: PopRow[] = [];
+  for (const r of data) {
+    const rawPop = r[iPOP] ?? "";
+    if (!/^\d+$/.test(rawPop)) continue;
+    const popInt = parseInt(rawPop, 10);
+    // 0~100이 기본. (혹시 0~1 스케일이면, 아래에서 100배)
+    let popPct = popInt;
+    if (popPct <= 1) popPct = popPct * 100;
 
-  // 첫 유효 숫자행 선택
-  const row = dataRows.find((r) => /^\d+$/.test(r[idxPOP] ?? ""));
-  if (!row) throw new Error("No numeric POP row");
+    let ts = Math.floor(Date.now() / 1000);
+    if (iT >= 0 && r[iT]) {
+      const t = parseToEpochSec(r[iT]);
+      if (t) ts = t;
+    }
 
-  const pop = parseInt(row[idxPOP], 10);
-
-  // 타임스탬프(초) 계산
-  let ts = Math.floor(Date.now() / 1000);
-  if (idxT !== -1) {
-    const raw = (row[idxT] || "").replace(" ", "T");
-    const d = new Date(/\+/.test(raw) ? raw : raw + "+09:00");
-    if (!isNaN(d.getTime())) ts = Math.floor(d.getTime() / 1000);
+    rows.push({ ts, popPct, raw: r });
   }
 
-  return { pop, ts, latency, url };
+  // 중복 시간 제거(가장 마지막 값 채택)
+  rows.sort((a, b) => a.ts - b.ts);
+  const uniq: PopRow[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    if (i === rows.length - 1 || rows[i].ts !== rows[i + 1].ts) uniq.push(rows[i]);
+  }
+
+  return { rows: uniq, latency, url };
 }
 
-/** InfluxDB v2 라인프로토콜 쓰기 */
-async function writeLines(lines: string[]): Promise<void> {
+/** Influx v2 write (precision=s) */
+async function writeLP(lines: string[]): Promise<void> {
   const url =
-    `${req("INFLUX_URL")}/api/v2/write` +
-    `?org=${encodeURIComponent(req("INFLUX_ORG"))}` +
-    `&bucket=${encodeURIComponent(req("INFLUX_BUCKET"))}` +
+    `${need("INFLUX_URL")}/api/v2/write` +
+    `?org=${encodeURIComponent(need("INFLUX_ORG"))}` +
+    `&bucket=${encodeURIComponent(need("INFLUX_BUCKET"))}` +
     `&precision=s`;
 
   const res = await fetch(url, {
     method: "POST",
     headers: {
-      Authorization: `Token ${req("INFLUX_TOKEN")}`,
+      Authorization: `Token ${need("INFLUX_TOKEN")}`,
       "Content-Type": "text/plain; charset=utf-8",
     },
     body: lines.join("\n"),
@@ -155,28 +198,30 @@ async function writeLines(lines: string[]): Promise<void> {
   }
 }
 
-/** 메인 */
+/** main */
 (async () => {
-  // 환경변수 확인
   const reg = (env.POP_REG || "").trim();
-  if (!reg) throw new Error("POP_REG 미설정: .env에 예보구역 코드(POP_REG)를 넣어주세요.");
+  if (!reg) throw new Error("POP_REG 미설정: 예보구역 코드(POP_REG)를 넣어주세요.");
   const loc = env.LOC?.trim() || "seoul";
 
-  // POP 1건 수집
-  const { pop, ts, latency, url } = await fetchPop(reg);
-  console.log(`POP=${pop} ts=${ts} reg=${reg}\nfrom: ${url}`);
+  const { rows, latency, url } = await fetchPopRows(reg);
 
-  // 라인프로토콜 작성
+  if (rows.length === 0) throw new Error("POP rows not found");
+
+  // 라인프로토콜 생성: measurement=pop / field=pop_pct(float)
+  const points = rows.map(
+    ({ ts, popPct }) => `pop,source=kmahub-di2,loc=${loc},reg=${reg} pop_pct=${popPct.toFixed(1)} ${ts}`
+  );
+
+  // 헬스체크(현재시각)
   const now = Math.floor(Date.now() / 1000);
-  const lines = [
-    // 예보
-    `forecast,source=kmahub-dl2,loc=${loc},reg=${reg} pop_pct=${pop}i ${ts}`,
-    // 프로브(가용성/지연)
-    `api_probe,service=pop_kmahub,env=dev,loc=${loc} success=1i,latency_ms=${latency}i ${now}`,
-  ];
+  points.push(`api_probe,service=pop_kmahub,env=prod,loc=${loc} success=1i,latency_ms=${latency}i ${now}`);
 
-  // Influx로 전송
-  await writeLines(lines);
+  await writeLP(points);
+
+  console.log(`POP rows written: ${rows.length}`);
+  console.log(`first=${rows[0].popPct}% @ ${rows[0].ts}, last=${rows[rows.length - 1].popPct}% @ ${rows[rows.length - 1].ts}`);
+  console.log(`from: ${url}`);
   console.log("Influx write OK");
 })().catch((e) => {
   console.error(e);
