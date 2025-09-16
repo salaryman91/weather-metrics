@@ -8,6 +8,7 @@ jobs:
   run:
     runs-on: ubuntu-latest
     env:
+      TZ: Asia/Seoul
       INFLUX_URL:    ${{ secrets.INFLUX_URL }}
       INFLUX_TOKEN:  ${{ secrets.INFLUX_TOKEN }}
       INFLUX_ORG:    ${{ secrets.INFLUX_ORG }}
