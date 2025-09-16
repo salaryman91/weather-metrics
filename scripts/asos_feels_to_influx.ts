@@ -190,7 +190,8 @@ async function fetchLatestASOS(stn: string){
     const td = iTD>=0 ? rowsN[k][iTD] : NaN;
     const rhHM = iHM>=0 ? rowsN[k][iHM] : NaN;
     if (isFinite(ts) && isFinite(tC) && isFinite(wMs)){
-      picks.push({ ts, tC, td: isFinite(td)? td : undefined, rhHM: isFinite(rhHM)? rhHM : undefined, raw });
+      // 🔧 FIX: wMs 누락됐던 부분을 추가
+      picks.push({ ts, tC, td: isFinite(td)? td : undefined, rhHM: isFinite(rhHM)? rhHM : undefined, wMs, raw });
     }
   }
   if (!picks.length) throw new Error("ASOS: no parsable timestamp rows");
@@ -218,7 +219,7 @@ async function fetchLatestASOS(stn: string){
             : (latest.tC<=10 && latest.wMs>1.34) ? windChillC(latest.tC, latest.wMs)
             : latest.tC;
 
-  // 과도한 차이 보정(혹시 HM이 있었고 Td 기반이 더 합리적일 때)
+  // Td가 있으면 대안 계산(더 합리적이면 교체)
   if (isFinite(latest.td as number)) {
     const rhTd = rhFromTd(latest.tC, latest.td as number);
     const alt  = (latest.tC>=27 && rhTd>=40) ? heatIndexC(latest.tC, rhTd)
