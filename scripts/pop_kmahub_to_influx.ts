@@ -1,239 +1,235 @@
+import "dotenv/config";
+
 /**
- * KMAHub 단기 육상예보 fct_afs_dl2 → POP(강수확률) 타임라인 전량 적재
- *   measurement=pop, source=kmahub-dl2, field=pop_pct(0~100, int)
+ * KMA POP/Rainfall → Influx (forecast + nowcast)
+ * - Forecast hourly rainfall (PCP, mm) & precip probability (POP, %) via getVilageFcst
+ * - Current 1-hour rainfall (RN1, mm) via getUltraSrtNcst
  *
- * 실행:
- *   npx ts-node scripts/pop_kmahub_to_influx.ts
- *
- * 필요 .env / Actions:
- *   INFLUX_URL, INFLUX_TOKEN, INFLUX_ORG, INFLUX_BUCKET
- *   APIHUB_BASE=https://apihub.kma.go.kr
- *   APIHUB_KEY=<authKey>
- *   POP_REG=<예보구역코드> (예: 11B10101)
- *   LOC=seoul (선택)
- *
- * 디버그:
- *   DEBUG_POP=1   // 헤더·샘플 로깅
+ * Measurement/fields (precision=s):
+ *   forecast,source=kma-vilage pcp_mm=<float>,pop_pct=<int>,base_time_s=<int>
+ *   nowcast,source=kma-ultra-ncst rn1_mm=<float>,base_time_s=<int>
+ *   api_probe,service=pop_vilage|rn1_ultra success=<int>,latency_ms=<int>[,n_points=<int>,note="..."]
  */
 
-import * as iconv from "iconv-lite";
-
 type Env = {
-  INFLUX_URL: string;
-  INFLUX_TOKEN: string;
-  INFLUX_ORG: string;
-  INFLUX_BUCKET: string;
-  APIHUB_BASE: string;
-  APIHUB_KEY: string;
-  POP_REG?: string;
-  LOC?: string;
+  INFLUX_URL: string; INFLUX_TOKEN: string; INFLUX_ORG: string; INFLUX_BUCKET: string;
+  APIHUB_BASE: string; APIHUB_KEY: string;
+  POP_REG?: string; LOC?: string; NX?: string; NY?: string;
 };
-const env = process.env as unknown as Env;
-const need = (k: keyof Env) => {
-  const v = env[k];
-  if (!v) throw new Error(`Missing env: ${k}`);
-  return v;
+const env: Env = {
+  INFLUX_URL: process.env.INFLUX_URL!,
+  INFLUX_ORG: process.env.INFLUX_ORG!,
+  INFLUX_BUCKET: process.env.INFLUX_BUCKET!,
+  INFLUX_TOKEN: process.env.INFLUX_TOKEN!,
+  APIHUB_BASE: (process.env.APIHUB_BASE || "https://apihub.kma.go.kr").replace(/\/+$/,""),
+  APIHUB_KEY: process.env.APIHUB_KEY!,
+  POP_REG: process.env.POP_REG || "11B10101",
+  LOC: process.env.LOC || "seoul",
+  NX: process.env.NX || "60",
+  NY: process.env.NY || "127",
 };
-const DBG = !!process.env.DEBUG_POP;
+const DBG = process.env.DEBUG_POP === "1" || process.env.DEBUG === "1";
+const need = <K extends keyof Env>(k: K) => {
+  const v = env[k]; if (!v) throw new Error(`[FATAL] Missing env: ${String(k)}`); return v as NonNullable<Env[K]>;
+};
 
-// ---------- 유틸 ----------
-/** 안전 CSV split (따옴표/이중따옴표 이스케이프 지원) */
-function splitCSVLine(line: string): string[] {
-  const out: string[] = []; let cur = ""; let q = false;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i];
-    if (c === '"') {
-      if (q && line[i + 1] === '"') { cur += '"'; i++; }
-      else { q = !q; }
-    } else if (c === "," && !q) {
-      out.push(cur); cur = "";
-    } else {
-      cur += c;
-    }
+// ----- time helpers (KST) -----
+const pad2 = (n: number) => String(n).padStart(2,"0");
+const toIsoKst = (yyyymmdd: string, hhmm: string) => {
+  const yyyy = yyyymmdd.slice(0,4), MM = yyyymmdd.slice(4,6), dd = yyyymmdd.slice(6,8);
+  const HH = hhmm.slice(0,2), mm = hhmm.slice(2,4);
+  return `${yyyy}-${MM}-${dd}T${HH}:${mm}:00+09:00`;
+};
+const toEpochSec = (iso: string) => Math.floor(new Date(iso).getTime()/1000);
+
+// 초단기 base: (분<45) → 직전 시각 HH00, (분≥45) → HH30
+function ultraBase(date = new Date()) {
+  const d = new Date(date);
+  const yyyy = d.getFullYear(); const MM = pad2(d.getMonth()+1); const dd = pad2(d.getDate());
+  let HH = d.getHours(); const m = d.getMinutes();
+  let base_time = m < 45 ? `${pad2((HH+23)%24)}00` : `${pad2(HH)}30`;
+  let base_date = `${yyyy}${MM}${dd}`;
+  if (m < 45 && HH === 0) {
+    const p = new Date(d.getTime() - 86400_000);
+    base_date = `${p.getFullYear()}${pad2(p.getMonth()+1)}${pad2(p.getDate())}`;
   }
-  out.push(cur);
-  return out.map((s) => s.trim());
+  return { base_date, base_time };
 }
 
-async function decodeKR(res: Response): Promise<string> {
-  const ab = await res.arrayBuffer();
-  const buf = Buffer.from(ab);
-  const ct = (res.headers.get("content-type") || "").toLowerCase();
-
-  if (/euc-?kr|ks_c_5601|cp949/.test(ct)) return iconv.decode(buf, "euc-kr");
-  if (/utf-?8/.test(ct)) return buf.toString("utf8");
-
-  const utf = buf.toString("utf8");
-  if (utf.includes("\uFFFD")) return iconv.decode(buf, "euc-kr"); // 깨짐 감지 → EUC-KR 재해석
-  return utf;
-}
-
-/** YYYYMMDDHHmm[ss] / ISO(공백 포함) → epoch(sec) [KST 처리] */
-function parseTsKST(raw: string): number | null {
-  const s = raw.trim().replace(" ", "T");
-  // 12~14자리(초 포함) 지원
-  if (/^\d{12,14}$/.test(s)) {
-    const yyyy = s.slice(0, 4), MM = s.slice(4, 6), dd = s.slice(6, 8),
-          HH = s.slice(8, 10), mm = s.slice(10, 12), ss = (s.slice(12, 14) || "00");
-    const iso = `${yyyy}-${MM}-${dd}T${HH}:${mm}:${ss}+09:00`;
-    const d = new Date(iso);
-    return isNaN(d.getTime()) ? null : Math.floor(d.getTime() / 1000);
-  }
-  const iso = s.includes("T") ? s : s.replace(" ", "T");
-  const d = new Date(/\+/.test(iso) ? iso : iso + "+09:00");
-  return isNaN(d.getTime()) ? null : Math.floor(d.getTime() / 1000);
-}
-
-const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
-
-// ---------- Influx ----------
-async function writeLP(lines: string[]): Promise<void> {
-  const url = `${need("INFLUX_URL")}/api/v2/write`
-    + `?org=${encodeURIComponent(need("INFLUX_ORG"))}`
-    + `&bucket=${encodeURIComponent(need("INFLUX_BUCKET"))}`
-    + `&precision=s`;
+// ----- Influx -----
+async function writeLP(lines: string[]) {
+  if (!lines.length) return;
+  const url = `${need("INFLUX_URL")}/api/v2/write?org=${encodeURIComponent(need("INFLUX_ORG"))}&bucket=${encodeURIComponent(need("INFLUX_BUCKET"))}&precision=s`;
   const res = await fetch(url, {
     method: "POST",
-    headers: {
-      Authorization: `Token ${need("INFLUX_TOKEN")}`,
-      "Content-Type": "text/plain; charset=utf-8",
-    },
+    headers: { "Authorization": `Token ${need("INFLUX_TOKEN")}`, "Content-Type": "text/plain; charset=utf-8" },
     body: lines.join("\n"),
   });
-  if (!res.ok) throw new Error(`Influx write ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new Error(`Influx write ${res.status}: ${await res.text().catch(()=>"...")}`);
 }
 
-// ---------- POP 수집 ----------
-type PopRow = { ts: number; pop: number };
-
-function looksLikeHeader(s: string): boolean {
-  return /(POP|강수확률)/i.test(s) && /,/.test(s);
-}
-
-/** fct_afs_dl2: CSV(help=1, disp=1) 파싱 → 전량 {ts,pop} */
-async function fetchPopSeries(reg: string): Promise<{ rows: PopRow[]; url: string; latency: number }> {
-  const qs = new URLSearchParams({
-    reg,
-    tmfc: "0",     // 최신 발표 묶음
-    disp: "1",     // CSV
-    help: "1",     // 헤더 포함
-    authKey: need("APIHUB_KEY"),
+// ----- API Hub JSON caller (typ02 → typ01 fallback) -----
+async function callKMAJSON(path: string, params: Record<string,string>) {
+  const base = need("APIHUB_BASE");
+  const sp = new URLSearchParams({ dataType: "JSON", numOfRows: "1000", pageNo: "1", ...params,
+    serviceKey: need("APIHUB_KEY"), authKey: need("APIHUB_KEY") // 양쪽 키 파라미터 동시
   });
-  const url = `${need("APIHUB_BASE")}/api/typ01/url/fct_afs_dl2.php?${qs.toString()}`;
 
-  const t0 = Date.now();
-  const res = await fetch(url);
-  const latency = Date.now() - t0;
-  const text = await decodeKR(res);
-  if (!res.ok) throw new Error(`KMAHub ${res.status}: ${text.slice(0, 200)}`);
-
-  // BOM/공백/주석 제거
-  const linesAll = text.replace(/\ufeff/g, "")
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0 && !l.startsWith("#"));
-
-  if (linesAll.length === 0) throw new Error("No lines");
-
-  // 헤더 라인 탐색(최대 5줄)
-  let headerIdx = 0;
-  for (let i = 0; i < Math.min(5, linesAll.length); i++) {
-    if (looksLikeHeader(linesAll[i])) { headerIdx = i; break; }
-  }
-  const header = splitCSVLine(linesAll[headerIdx]);
-  const dataRows = linesAll.slice(headerIdx + 1).map(splitCSVLine).filter(r => r.length >= header.length);
-
-  if (DBG) {
-    console.log("POP header:", header);
-    console.log("POP first 3 rows:", dataRows.slice(0, 3));
-  }
-
-  // 컬럼 인덱스 탐색
-  let idxPOP = header.findIndex(h => /^(ST|POP)$/i.test(h) || /강수확률/.test(h));
-  let idxT   = header.findIndex(h => /(tmef|ftime|time|valid|fcst)/i.test(h));
-
-  // 시간 컬럼 미탐색 시: 데이터 기반 추정 (12~14자리 시각이 3회 이상 파싱되는 열)
-  if (idxT === -1 && dataRows.length) {
-    const cols = dataRows[0].length;
-    let best = -1, score = -1;
-    for (let c = 0; c < cols; c++) {
-      let ok = 0, tot = 0;
-      for (const r of dataRows.slice(0, 24)) {
-        const ts = parseTsKST(r[c] || "");
-        if (ts) ok++;
-        tot++;
-      }
-      if (ok >= 3 && ok > score) { score = ok; best = c; }
+  async function tryUrl(u: string) {
+    const t0 = Date.now();
+    const res = await fetch(u);
+    const latency = Date.now() - t0;
+    const txt = await res.text();
+    try {
+      const json = JSON.parse(txt);
+      const header = json?.response?.header; const body = json?.response?.body;
+      const code = header?.resultCode; const msg = header?.resultMsg;
+      const items = body?.items?.item ?? [];
+      if (DBG) console.log(`[DEBUG] call ${u}\n[DEBUG] header resultCode=${code||"-"} msg=${msg||"-"} latency=${latency}ms items=${items.length}`);
+      return { ok: res.ok && (code === "00" || code === "NORMAL_SERVICE"), items, header, body, latency, url: u, raw: txt };
+    } catch (e) {
+      if (DBG) console.log(`[DEBUG] JSON parse fail: ${(e as Error).message}`);
+      return { ok: false, items: [], header: {}, body: {}, latency, url: u, raw: txt };
     }
-    idxT = best;
   }
 
-  if (idxPOP === -1) throw new Error("POP column not found");
-  if (idxT   === -1) throw new Error("Time column not found (tmef/ftime/valid)");
-
-  const rows: PopRow[] = [];
-  for (const r of dataRows) {
-    const pRaw = (r[idxPOP] ?? "").trim();
-    if (!/^\d+$/.test(pRaw)) continue;
-    const pop = clamp(parseInt(pRaw, 10), 0, 100);
-
-    const ts = parseTsKST(r[idxT] || "");
-    if (!ts) continue;
-
-    rows.push({ ts, pop });
+  const url1 = `${base}/api/typ02/openApi/${path}?${sp.toString()}`;
+  let out = await tryUrl(url1);
+  if (!out.ok) {
+    const url2 = `${base}/api/typ01/openApi/${path}?${sp.toString()}`;
+    out = await tryUrl(url2);
   }
-
-  if (!rows.length) throw new Error("No numeric POP rows with valid time");
-
-  // 정렬 & 중복(ts) 마지막 값 우선
-  rows.sort((a, b) => a.ts - b.ts);
-  const dedup = new Map<number, number>();
-  for (const { ts, pop } of rows) dedup.set(ts, pop);
-  const out: PopRow[] = Array.from(dedup.entries()).map(([ts, pop]) => ({ ts, pop }))
-    .sort((a, b) => a.ts - b.ts);
-
-  return { rows: out, url, latency };
+  return out;
 }
 
-// ---------- 메인 ----------
-(async () => {
-  const reg = (env.POP_REG || "").trim();
-  if (!reg) throw new Error("POP_REG 미설정");
-  const loc = env.LOC?.trim() || "seoul";
+// ----- parsing helpers -----
+function parsePCPmm(v: string): number | null {
+  const s = (v||"").trim();
+  if (!s) return null;
+  if (s.includes("없음")) return 0;
+  if (s.includes("미만")) return 0.1;
+  if (s.includes("이상")) { const m = s.match(/(\d+(?:\.\d+)?)/); return m ? parseFloat(m[1]) : null; }
+  const m = s.match(/-?\d+(?:\.\d+)?/);
+  return m ? parseFloat(m[0]) : null;
+}
+function parsePOPpct(v: string): number | null {
+  const m = (v||"").match(/\d+/);
+  if (!m) return null;
+  const n = Math.max(0, Math.min(100, parseInt(m[0],10)));
+  return Number.isFinite(n) ? n : null;
+}
+function parseRN1mm(v: unknown): number {
+  if (typeof v === "number") return v;
+  if (typeof v === "string") { const m = v.match(/-?\d+(?:\.\d+)?/); return m ? parseFloat(m[0]) : 0; }
+  return 0;
+}
 
-  try {
-    const { rows, url, latency } = await fetchPopSeries(reg);
+// ----- fetchers -----
+async function fetchForecast(nx: string, ny: string) {
+  // 단기예보(동네예보): PCP + POP 함께 수집
+  const { base_date, base_time } = ultraBase(); // 기준시각은 00/30 규칙으로 충분
+  const out = await callKMAJSON("VilageFcstInfoService_2.0/getVilageFcst", { base_date, base_time, nx, ny });
+  if (!out.ok) throw Object.assign(new Error(`[vilage] call failed`), { note: String(out.raw||"").slice(0,200), latency: out.latency, url: out.url });
 
-    // 시계열 가시화용 시간창 (과거 12h ~ +72h)
-    const now = Math.floor(Date.now() / 1000);
-    const minTs = now - 12 * 3600;
-    const maxTs = now + 72 * 3600;
-
-    const lines: string[] = [];
-    for (const { ts, pop } of rows) {
-      if (ts < minTs || ts > maxTs) continue;
-      // DL2는 % 정수라고 가정(보정 없음). 0~100 범위는 이미 clamp.
-      lines.push(`pop,source=kmahub-dl2,loc=${loc},reg=${reg} pop_pct=${pop}i ${ts}`);
+  type Acc = { pcp?: number; pop?: number };
+  const acc = new Map<number, Acc>(); // ts(sec) → {pcp, pop}
+  for (const it of (out.items as any[])) {
+    const y = String(it.fcstDate), h = String(it.fcstTime);
+    const ts = toEpochSec(toIsoKst(y,h));
+    if (!Number.isFinite(ts)) continue;
+    const cur = acc.get(ts) || {};
+    if (it.category === "PCP") {
+      const p = parsePCPmm(String(it.fcstValue ?? ""));
+      if (p != null) cur.pcp = p;
+    } else if (it.category === "POP") {
+      const q = parsePOPpct(String(it.fcstValue ?? ""));
+      if (q != null) cur.pop = q;
     }
-
-    if (DBG) console.log(`toWrite=${lines.length}, window=[${new Date(minTs*1000).toISOString()} ~ ${new Date(maxTs*1000).toISOString()}]`);
-    if (!lines.length) throw new Error("No rows in time window (past 12h ~ +72h)");
-
-    // 본 데이터 + 수집 프로브
-    const probeTs = Math.floor(Date.now() / 1000);
-    lines.push(`api_probe,service=pop_kmahub_dl2,env=prod,loc=${loc} success=1i,latency_ms=${latency}i ${probeTs}`);
-
-    await writeLP(lines);
-    console.log(`Wrote POP points: ${lines.length - 1}\nfrom: ${url}`);
-  } catch (e: any) {
-    // 실패도 프로브로 기록하고 Job 계속(스케줄 유지)
-    const locTag = env.LOC?.trim() || "seoul";
-    const now = Math.floor(Date.now() / 1000);
-    const latency = Number.isFinite(e?.latency) ? e.latency : 0;
-    try {
-      await writeLP([`api_probe,service=pop_kmahub_dl2,env=prod,loc=${locTag} success=0i,latency_ms=${latency}i ${now}`]);
-    } catch {}
-    console.error(e);
-    process.exit(0);
+    if (cur.pcp != null || cur.pop != null) acc.set(ts, cur);
   }
-})();
+  const base_s = toEpochSec(toIsoKst(base_date, base_time));
+  const rows = [...acc.entries()].sort((a,b)=>a[0]-b[0]).map(([ts, v]) => ({ ts, ...v, base_s }));
+  if (DBG) console.log(`[INFO] forecast rows=${rows.length} base=${base_date} ${base_time}`);
+  return { rows, base_date, base_time };
+}
+
+async function fetchUltraRN1(nx: string, ny: string) {
+  const { base_date, base_time } = ultraBase();
+  const out = await callKMAJSON("VilageFcstInfoService_2.0/getUltraSrtNcst", { base_date, base_time, nx, ny });
+  if (!out.ok) throw Object.assign(new Error(`[ultra-ncst] call failed`), { note: String(out.raw||"").slice(0,200), latency: out.latency, url: out.url });
+
+  let rn1: number | null = null;
+  let ts = 0;
+  for (const it of (out.items as any[])) {
+    if (it.category === "RN1") {
+      rn1 = parseRN1mm(it.obsrValue ?? it.fcstValue ?? "0");
+      // 관측시각은 자료상 baseDate/baseTime와 같거나 항목에 포함됨
+      const y = String(it.baseDate || it.fcstDate || out.body?.baseDate || base_date);
+      const h = String(it.baseTime || it.fcstTime || out.body?.baseTime || base_time);
+      ts = toEpochSec(toIsoKst(y, h));
+      break;
+    }
+  }
+  return { rn1, ts, base_date, base_time };
+}
+
+// ----- main -----
+(async () => {
+  const loc = env.LOC!.trim(); const reg = env.POP_REG!.trim();
+  const nx = env.NX!.trim();   const ny = env.NY!.trim();
+
+  const lines: string[] = [];
+
+  // 1) Forecast (PCP + POP)
+  try {
+    const f = await fetchForecast(nx, ny);
+    const now = Math.floor(Date.now()/1000);
+    const minS = now - 12*3600, maxS = now + 72*3600; // 보존 범위
+    let n = 0, nPOP = 0, nPCP = 0;
+    for (const r of f.rows) {
+      if (r.ts < minS || r.ts > maxS) continue;
+      const tags = `forecast,source=kma-vilage,loc=${loc},reg=${reg},nx=${nx},ny=${ny}`;
+      const fields: string[] = [`base_time_s=${r.base_s}i`];
+      if (typeof r.pcp === "number") { fields.unshift(`pcp_mm=${r.pcp.toFixed(2)}`); nPCP++; }
+      if (typeof r.pop === "number") { fields.unshift(`pop_pct=${Math.round(r.pop)}i`); nPOP++; }
+      lines.push(`${tags} ${fields.join(",")} ${r.ts}`);
+      n++;
+    }
+    const probeTs = Math.floor(Date.now()/1000);
+    lines.push(`api_probe,service=pop_vilage,env=prod,loc=${loc} success=1i,latency_ms=${0}i,n_points=${n}i,n_pop=${nPOP}i,n_pcp=${nPCP}i ${probeTs}`);
+  } catch (e:any) {
+    const probeTs = Math.floor(Date.now()/1000);
+    lines.push(`api_probe,service=pop_vilage,env=prod,loc=${loc} success=0i,latency_ms=${e?.latency||0}i,note="${String(e?.note||e?.message||'err').replace(/"/g,'\\"')}" ${probeTs}`);
+    if (DBG) console.error("[WARN] forecast fetch failed", e?.message || e);
+  }
+
+  // 2) Nowcast (RN1)
+  try {
+    const u = await fetchUltraRN1(nx, ny);
+    if (u.rn1 != null && u.ts > 0) {
+      const base_s = toEpochSec(toIsoKst(u.base_date, u.base_time));
+      lines.push(`nowcast,source=kma-ultra-ncst,loc=${loc},reg=${reg},nx=${nx},ny=${ny} rn1_mm=${u.rn1.toFixed(1)},base_time_s=${base_s}i ${u.ts}`);
+      const probeTs = Math.floor(Date.now()/1000);
+      lines.push(`api_probe,service=rn1_ultra,env=prod,loc=${loc} success=1i,latency_ms=${0}i ${probeTs}`);
+    } else {
+      const probeTs = Math.floor(Date.now()/1000);
+      lines.push(`api_probe,service=rn1_ultra,env=prod,loc=${loc} success=0i,latency_ms=0i,note="no RN1" ${probeTs}`);
+    }
+  } catch (e:any) {
+    const probeTs = Math.floor(Date.now()/1000);
+    lines.push(`api_probe,service=rn1_ultra,env=prod,loc=${loc} success=0i,latency_ms=${e?.latency||0}i,note="${String(e?.note||e?.message||'err').replace(/"/g,'\\"')}" ${probeTs}`);
+    if (DBG) console.error("[WARN] ultra ncst fetch failed", e?.message || e);
+  }
+
+  if (!lines.length) {
+    console.warn("[WARN] No lines to write");
+    return;
+  }
+  if (DBG) console.log("[SAMPLE]\n" + lines.slice(0,2).join("\n"));
+
+  await writeLP(lines);
+  console.log(`[OK] Influx write done — lines=${lines.length}`);
+})().catch(err => {
+  console.error(err?.message || err);
+  process.exitCode = 0;
+});

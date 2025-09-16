@@ -1,26 +1,53 @@
 name: asos-feels-kmahub
+
 on:
   schedule:
-    - cron: "12 * * * *"   # 매 정시 +12분(UTC) = KST 정시 +12분
-  workflow_dispatch: {}
+    # 초단기 실황(getUltraSrtNcst) 기준시각이 00/30분에 갱신 → +5분 여유
+    - cron: "5,35 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: asos-feels
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
       TZ: Asia/Seoul
-      INFLUX_URL:    ${{ secrets.INFLUX_URL }}
-      INFLUX_TOKEN:  ${{ secrets.INFLUX_TOKEN }}
-      INFLUX_ORG:    ${{ secrets.INFLUX_ORG }}
-      INFLUX_BUCKET: ${{ secrets.INFLUX_BUCKET }}
-      APIHUB_KEY:    ${{ secrets.APIHUB_KEY }}
-      APIHUB_BASE:   ${{ vars.APIHUB_BASE }}
-      ASOS_STN:      ${{ vars.ASOS_STN }}
-      LOC:           ${{ vars.LOC || 'seoul' }}
+
+      # --- Influx ---
+      INFLUX_URL:     ${{ vars.INFLUX_URL }}
+      INFLUX_ORG:     ${{ vars.INFLUX_ORG }}
+      INFLUX_BUCKET:  ${{ vars.INFLUX_BUCKET }}
+      INFLUX_TOKEN:   ${{ secrets.INFLUX_TOKEN }}
+
+      # --- KMA API Hub ---
+      APIHUB_BASE:    ${{ vars.APIHUB_BASE }}    # e.g. https://apihub.kma.go.kr
+      APIHUB_KEY:     ${{ secrets.APIHUB_KEY }}
+
+      # --- 위치/지점 태그 ---
+      LOC:            ${{ vars.LOC }}            # 스크립트 기본값이 'seoul'이라 미지정이어도 OK
+      ASOS_STN:       ${{ vars.ASOS_STN }}       # 태그 용(108 등)
+
+      # --- 격자 좌표(초단기 실황용): 서울 기본 60/127 ---
+      NX:             ${{ vars.NX }}
+      NY:             ${{ vars.NY }}
+
+      # 필요시 디버그
+      # DEBUG_POP: "1"
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
-        with: { node-version: "20" }
-      - run: npm i -D typescript ts-node dotenv-cli @types/node
-      - run: npm i iconv-lite
-      - run: npx ts-node scripts/asos_feels_to_influx.ts
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run feels (HI/WC/AT + actual T)
+        run: npx ts-node scripts/asos_feels_to_influx.ts

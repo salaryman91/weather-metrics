@@ -1,340 +1,171 @@
+import "dotenv/config";
+
 /**
- * ASOS 시간자료(kma_sfctm2.php) 수집 → 체감온도(AT/Wind Chill) 계산 → InfluxDB 적재
+ * Apparent Temperature (체감온도) + 실제 기온 수집 → Influx
+ * - Source: KMA API Hub Ultra Short NOWCAST (getUltraSrtNcst)
+ *   categories used: T1H(기온, °C), REH(상대습도, %), WSD(풍속, m/s)
+ * - Feels Like 선택 규칙
+ *   - if T>=27°C and RH>=40% → Heat Index (NWS Rothfusz)
+ *   - else if T<=10°C and wind>=1.34 m/s → Wind Chill (Celsius formula)
+ *   - else → Australian Apparent Temperature (Steadman, shade, no radiation)
  *
- * 실행(로컬):  npx ts-node scripts/asos_feels_to_influx.ts
+ * Measurement/fields (precision=s)
+ *   life_index,source=kma-ultra-ncst,loc=<loc>,stn=<108>,method=hi|wc|at
+ *     temp_c=<float>,rh_pct=<float>,wind_ms=<float>,feels_c=<float>,
+ *     heat_index_c=<float?>,wind_chill_c=<float?>,apparent_c=<float?>,
+ *     base_time_s=<int>
+ *   api_probe,service=feels_ultra,env=prod,loc=<loc> success=<int>,latency_ms=<int>
  *
- * 필요 환경변수:
- *   INFLUX_URL, INFLUX_TOKEN, INFLUX_ORG, INFLUX_BUCKET
- *   APIHUB_BASE=https://apihub.kma.go.kr
- *   APIHUB_KEY=<authKey>
- *   ASOS_STN=108 (예: 서울)
- *   LOC=seoul (선택)
+ * 실행(로컬):
+ *   npx dotenv -e .env -- ts-node scripts/asos_feels_to_influx.ts
+ * 필요 env: INFLUX_URL, INFLUX_TOKEN, INFLUX_ORG, INFLUX_BUCKET,
+ *           APIHUB_BASE, APIHUB_KEY, LOC=seoul, NX=60, NY=127, ASOS_STN=108
  */
 
-import iconv from "iconv-lite";
-
 type Env = {
-  INFLUX_URL: string;
-  INFLUX_TOKEN: string;
-  INFLUX_ORG: string;
-  INFLUX_BUCKET: string;
-  APIHUB_BASE: string;
-  APIHUB_KEY: string;
-  ASOS_STN?: string;
-  LOC?: string;
+  INFLUX_URL: string; INFLUX_TOKEN: string; INFLUX_ORG: string; INFLUX_BUCKET: string;
+  APIHUB_BASE: string; APIHUB_KEY: string;
+  LOC?: string; NX?: string; NY?: string; ASOS_STN?: string;
 };
 const env = process.env as unknown as Env;
-const need = (k: keyof Env): string => {
-  const v = env[k];
-  if (!v) throw new Error(`Missing env: ${k}`);
-  return v;
-};
+const need = (k: keyof Env) => { const v = env[k]; if (!v) throw new Error(`[FATAL] Missing env: ${k}`); return v; };
+const DBG = !!(process.env.DEBUG_POP || process.env.DEBUG);
 
-// ---------- 유틸 ----------
-function splitCSVLine(line: string): string[] {
-  const out: string[] = [];
-  let cur = "";
-  let q = false;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i];
-    if (c === '"') {
-      if (q && line[i + 1] === '"') {
-        cur += '"';
-        i++;
-      } else {
-        q = !q;
-      }
-    } else if (c === "," && !q) {
-      out.push(cur);
-      cur = "";
-    } else {
-      cur += c;
+// ---- time helpers (KST base rule for Ultra) ----
+const pad2 = (n: number) => String(n).padStart(2, "0");
+const toIsoKst = (yyyymmdd: string, hhmm: string) => `${yyyymmdd.slice(0,4)}-${yyyymmdd.slice(4,6)}-${yyyymmdd.slice(6,8)}T${hhmm.slice(0,2)}:${hhmm.slice(2,4)}:00+09:00`;
+const toEpochSec = (iso: string) => Math.floor(new Date(iso).getTime() / 1000);
+
+function ultraBase(date = new Date()) {
+  const d = new Date(date);
+  const yyyy = d.getFullYear(); const MM = pad2(d.getMonth()+1); const dd = pad2(d.getDate());
+  const HH = d.getHours(); const m = d.getMinutes();
+  let base_time = m < 45 ? `${pad2((HH+23)%24)}00` : `${pad2(HH)}30`;
+  let base_date = `${yyyy}${MM}${dd}`;
+  if (m < 45 && HH === 0) { const p = new Date(d.getTime()-86400000); base_date = `${p.getFullYear()}${pad2(p.getMonth()+1)}${pad2(p.getDate())}`; }
+  return { base_date, base_time };
+}
+
+// ---- Influx ----
+async function writeLP(lines: string[]) {
+  if (!lines.length) return;
+  const url = `${need('INFLUX_URL')}/api/v2/write?org=${encodeURIComponent(need('INFLUX_ORG'))}&bucket=${encodeURIComponent(need('INFLUX_BUCKET'))}&precision=s`;
+  const res = await fetch(url, { method: 'POST', headers: { 'Authorization': `Token ${need('INFLUX_TOKEN')}`, 'Content-Type': 'text/plain; charset=utf-8' }, body: lines.join('\n') });
+  if (!res.ok) throw new Error(`Influx write ${res.status}: ${await res.text().catch(()=>"...")}`);
+}
+
+// ---- KMA JSON caller (typ02 → typ01 fallback) ----
+async function callKMAJSON(path: string, params: Record<string,string>) {
+  const base = need('APIHUB_BASE').replace(/\/+$/, '');
+  const sp = new URLSearchParams({ dataType: 'JSON', numOfRows: '1000', pageNo: '1', ...params, serviceKey: need('APIHUB_KEY'), authKey: need('APIHUB_KEY') });
+  async function tryUrl(u: string) {
+    const t0 = Date.now(); const res = await fetch(u); const latency = Date.now() - t0; const txt = await res.text();
+    try {
+      const json = JSON.parse(txt); const header = json?.response?.header; const body = json?.response?.body; const code = header?.resultCode; const msg = header?.resultMsg; const items = body?.items?.item ?? [];
+      if (DBG) console.log(`[DEBUG] call ${u}\n[DEBUG] header resultCode=${code||'-'} msg=${msg||'-'} latency=${latency}ms items=${items.length}`);
+      return { ok: res.ok && (code==='00' || code==='NORMAL_SERVICE'), items, header, body, latency, url: u, raw: txt };
+    } catch (e) {
+      if (DBG) console.log(`[DEBUG] JSON parse fail: ${(e as Error).message}`);
+      return { ok: false, items: [], header: {}, body: {}, latency, url: u, raw: txt };
     }
   }
-  out.push(cur);
-  return out.map((s) => s.trim());
+  let out = await tryUrl(`${base}/api/typ02/openApi/VilageFcstInfoService_2.0/getUltraSrtNcst?${sp.toString()}`);
+  if (!out.ok) out = await tryUrl(`${base}/api/typ01/openApi/VilageFcstInfoService_2.0/getUltraSrtNcst?${sp.toString()}`);
+  return out;
 }
 
-function toLinesKR(buf: ArrayBuffer): string[] {
-  const text = iconv.decode(Buffer.from(buf), "euc-kr");
-  return text.replace(/\ufeff/g, "").split(/\r?\n/);
+// ---- Feels-like formulas ----
+const c2f = (c:number)=> c*9/5+32; const f2c = (f:number)=> (f-32)*5/9;
+
+// Heat Index (NWS Rothfusz). Inputs: T(°C), RH(%). Returns °C.
+function heatIndexC(tC:number, rh:number): number {
+  const T = c2f(tC); const R = rh;
+  // Rothfusz regression (°F)
+  let HI = -42.379 + 2.04901523*T + 10.14333127*R - .22475541*T*R - .00683783*T*T - .05481717*R*R + .00122874*T*T*R + .00085282*T*R*R - .00000199*T*T*R*R;
+  // low humidity adjustment
+  if (R < 13 && T >= 80 && T <= 112) {
+    HI -= ((13 - R)/4) * Math.sqrt((17 - Math.abs(T - 95)) / 17);
+  }
+  // high humidity adjustment
+  if (R > 85 && T >= 80 && T <= 87) {
+    HI += ((R - 85)/10) * ((87 - T)/5);
+  }
+  return f2c(HI);
 }
 
-function toNum(s?: string): number {
-  const n = parseFloat(String(s ?? "").replace(/[^\d\.\-]/g, ""));
-  return Number.isFinite(n) ? n : NaN;
+// Wind Chill (Celsius version). Valid T<=10°C, v>=4.8 km/h
+function windChillC(tC:number, windMs:number): number {
+  const vKmh = windMs * 3.6;
+  return 13.12 + 0.6215*tC - 11.37*Math.pow(vKmh, 0.16) + 0.3965*tC*Math.pow(vKmh, 0.16);
 }
 
-const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
-
-// ---------- 열지수/바람차가 체감 ----------
-function apparentTempC(tC: number, rh: number, vMs: number): number {
-  // Australian Bureau of Meteorology AT 공식
-  const e = (rh / 100) * 6.105 * Math.exp((17.27 * tC) / (237.7 + tC));
-  return tC + 0.33 * e - 0.70 * vMs - 4;
-}
-function windChillC(tC: number, vMs: number): number {
-  const v = vMs * 3.6; // km/h
-  if (tC > 10 || v <= 4.8) return tC;
-  return 13.12 + 0.6215 * tC - 11.37 * Math.pow(v, 0.16) + 0.3965 * tC * Math.pow(v, 0.16);
-}
-// TD→RH (Magnus)
-function rhFromTD(tC: number, tdC: number): number {
-  const a = 17.625, b = 243.04;
-  const es = Math.exp((a * tC) / (b + tC));
-  const e = Math.exp((a * tdC) / (b + tdC));
-  return clamp(100 * (e / es), 1, 100);
+// Australian Apparent Temperature (Steadman, shade). ws in m/s
+function apparentTempC(tC:number, rh:number, windMs:number): number {
+  const e = (rh/100) * 6.105 * Math.exp((17.27*tC)/(237.7 + tC)); // hPa
+  return tC + 0.33*e - 0.70*windMs - 4.00;
 }
 
-// ---------- Influx ----------
-async function writeLP(lines: string[]): Promise<void> {
-  const url =
-    `${need("INFLUX_URL")}/api/v2/write`
-    + `?org=${encodeURIComponent(need("INFLUX_ORG"))}`
-    + `&bucket=${encodeURIComponent(need("INFLUX_BUCKET"))}`
-    + `&precision=s`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Token ${need("INFLUX_TOKEN")}`,
-      "Content-Type": "text/plain; charset=utf-8",
-    },
-    body: lines.join("\n"),
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Influx write ${res.status}: ${body}`);
-  }
+function chooseFeels(tC:number, rh:number, windMs:number) {
+  if (tC >= 27 && rh >= 40) return { method: 'hi', value: heatIndexC(tC, rh) };
+  if (tC <= 10 && windMs >= 1.34) return { method: 'wc', value: windChillC(tC, windMs) };
+  return { method: 'at', value: apparentTempC(tC, rh, windMs) };
 }
 
-// ---------- 파서 ----------
-type PickedRow = {
-  ts: number;       // epoch seconds (KST)
-  tC: number;       // 기온
-  rh: number;       // 상대습도(%)
-  td?: number;      // 이슬점(선택)
-  wMs: number;      // 풍속(m/s)
-  raw: string[];    // 원행
-};
-
-type FetchOption = { help: 0 | 1; disp: 0 | 1; hours: number };
-
-async function tryFetch(stn: string, opt: FetchOption): Promise<PickedRow | null> {
-  const now = new Date();
-  const tm2 = now.toISOString().replace(/[-:]/g, "").slice(0, 12) + "00";
-  const tm1 = new Date(now.getTime() - opt.hours * 3600 * 1000)
-    .toISOString().replace(/[-:]/g, "").slice(0, 12) + "00";
-  const base = need("APIHUB_BASE");
-  const url =
-    `${base}/api/typ01/url/kma_sfctm2.php`
-    + `?stn=${encodeURIComponent(stn)}&tm1=${tm1}&tm2=${tm2}`
-    + `&disp=${opt.disp}&help=${opt.help}&authKey=${encodeURIComponent(need("APIHUB_KEY"))}`;
-
-  const res = await fetch(url);
-  const buf = await res.arrayBuffer();
-  if (!res.ok) {
-    const head = iconv.decode(Buffer.from(buf).subarray(0, 400), "euc-kr");
-    throw new Error(`ASOS ${res.status}: ${head}`);
+// ---- fetch, compute, write ----
+async function fetchUltraNow(nx:string, ny:string) {
+  const { base_date, base_time } = ultraBase();
+  const out = await callKMAJSON('VilageFcstInfoService_2.0/getUltraSrtNcst', { base_date, base_time, nx, ny });
+  if (!out.ok) throw Object.assign(new Error('[ultra-ncst] call failed'), { latency: out.latency, note: String(out.raw||'').slice(0,200), url: out.url });
+  let T: number|undefined, RH: number|undefined, W: number|undefined; let refISO = toIsoKst(base_date, base_time);
+  for (const it of (out.items as any[])) {
+    const cat = String(it.category);
+    if (cat === 'T1H') T = parseFloat(it.obsrValue ?? it.fcstValue);
+    else if (cat === 'REH') RH = parseFloat(it.obsrValue ?? it.fcstValue);
+    else if (cat === 'WSD') W = parseFloat(it.obsrValue ?? it.fcstValue);
+    if (it.baseDate && it.baseTime) refISO = toIsoKst(String(it.baseDate), String(it.baseTime));
   }
-
-  const lines = toLinesKR(buf);
-  const nonBlank = lines.filter(l => l.trim().length > 0);
-
-  // "자료가 없습니다" 등
-  if (nonBlank.some(l => /자료.?없|no data/i.test(l))) return null;
-
-  // 데이터 라인 추출
-  let dataLines = nonBlank.filter(l => !l.trim().startsWith("#"));
-  if (dataLines.length === 0) {
-    dataLines = nonBlank.filter(l => (l.match(/[\d\.]/g) || []).length >= 8);
-  }
-  if (dataLines.length === 0) return null;
-
-  // 헤더 후보
-  const headerLine =
-    [...nonBlank].reverse().find((l) =>
-      l.trim().startsWith("#") &&
-      /(TM|TIME|DATE).*(TA|기온).*(HM|RH|습도).*(WS|풍속)/i.test(l)
-    ) ?? null;
-
-  let mode: "csv" | "ws" = (headerLine && headerLine.includes(",")) ? "csv" : "ws";
-  if (!headerLine && dataLines[0].includes(",")) mode = "csv";
-
-  const split = (line: string) => {
-    const s = headerLine ? line.replace(/^#\s*/, "").trim() : line.trim();
-    return mode === "csv" ? splitCSVLine(s) : s.split(/\s+/);
-  };
-
-  const header = headerLine ? split(headerLine) : [];
-  const rows = dataLines.map(split).filter(r => r.length >= 5);
-  if (rows.length === 0) return null;
-
-  // 컬럼 인덱스 탐색
-  const cols = rows[0].length;
-  const numeric = rows.map((r) => r.map(toNum));
-
-  const findHeaderIdx = (re: RegExp) => header.findIndex(h => re.test(h));
-  let iTM = findHeaderIdx(/^(TM|TIME|DATE)$/i);
-  let iTA = findHeaderIdx(/^TA$/i) >= 0 ? findHeaderIdx(/^TA$/i) : findHeaderIdx(/기온|TEMP/i);
-  let iHM = findHeaderIdx(/^HM$/i) >= 0 ? findHeaderIdx(/^HM$/i) : findHeaderIdx(/(RH|습도)/i);
-  let iWS = findHeaderIdx(/^WS$/i) >= 0 ? findHeaderIdx(/^WS$/i) : findHeaderIdx(/(풍속|WIND)/i);
-  let iTD = findHeaderIdx(/^TD$/i) >= 0 ? findHeaderIdx(/^TD$/i) : findHeaderIdx(/이슬점|DEW/i);
-
-  const bestIndex = (ok: (v: number) => boolean) => {
-    let best = -1, score = -1;
-    for (let c = 0; c < cols; c++) {
-      let cnt = 0;
-      for (const row of numeric) { const v = row[c]; if (Number.isFinite(v) && ok(v)) cnt++; }
-      if (cnt > score) { score = cnt; best = c; }
-    }
-    return best;
-  };
-
-  // 헤더 실패 시 값 범위 기반 보정
-  if (iTA < 0) iTA = bestIndex(v => v > -50 && v < 50);
-  if (iWS < 0) iWS = bestIndex(v => v >= 0 && v <= 60);
-  if (iHM < 0) iHM = bestIndex(v => v >= 0 && v <= 100);
-  if (iTD < 0) iTD = bestIndex(v => v > -60 && v < 40);
-  if (iTM < 0 && rows.length) iTM = rows[0].findIndex(v => /^\d{12,14}$/.test(v));
-
-  // RH 꼬리열/이웃열 휴리스틱
-  if (iHM < 0 || iHM < cols - 12) {
-    const tail = Array.from({ length: Math.min(12, cols) }, (_, k) => cols - 1 - k).reverse();
-    for (const c of tail) {
-      const vals = numeric.slice(-40).map(r => r[c]).filter(Number.isFinite);
-      const pass = vals.length >= 8 && vals.filter(v => v >= 0 && v <= 100).length / vals.length >= 0.6;
-      if (pass) { iHM = c; break; }
-    }
-  }
-  if (iHM >= 0 && iTA >= 0) {
-    const neigh = [iHM - 1, iHM + 1].filter(i => i >= 0 && i < cols);
-    for (const c of neigh) {
-      const vals = numeric.slice(-40).map(r => r[c]).filter(Number.isFinite);
-      if (vals.length >= 6) {
-        const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
-        if (avg > -30 && avg < 40) { iTA = c; break; }
-      }
-    }
-  }
-
-  // 최신에서 과거로 훑으며 유효행 선택
-  for (let k = rows.length - 1; k >= 0; k--) {
-    const r = rows[k];
-    const tC = toNum(r[iTA]);
-    const hm = toNum(r[iHM]);
-    const td = iTD >= 0 ? toNum(r[iTD]) : NaN;
-    const ws = toNum(r[iWS]);
-
-    if (!Number.isFinite(tC) || !(tC > -30 && tC < 45)) continue;
-
-    // RH 확정
-    let rhVal = Number.isFinite(hm) ? hm : NaN;
-    if (!(rhVal >= 10 && rhVal <= 100) && Number.isFinite(td) && td > -60 && td < 40) {
-      rhVal = rhFromTD(tC, td);
-    }
-    if (!(rhVal >= 10 && rhVal <= 100)) continue;
-
-    // 풍속 확정
-    const wMsVal = Number.isFinite(ws) ? clamp(ws, 0, 40) : 0;
-
-    // 타임스탬프
-    let ts = Math.floor(Date.now() / 1000);
-    if (iTM >= 0) {
-      const raw = r[iTM];
-      if (/^\d{12,14}$/.test(raw)) {
-        const yyyy = raw.slice(0, 4), MM = raw.slice(4, 6), dd = raw.slice(6, 8),
-              HH = raw.slice(8, 10), mm = raw.slice(10, 12);
-        const iso = `${yyyy}-${MM}-${dd}T${HH}:${mm}:00+09:00`;
-        const d = new Date(iso);
-        if (!isNaN(d.getTime())) ts = Math.floor(d.getTime() / 1000);
-      } else {
-        const d = new Date(raw.replace(" ", "T") + (/\+/.test(raw) ? "" : "+09:00"));
-        if (!isNaN(d.getTime())) ts = Math.floor(d.getTime() / 1000);
-      }
-    }
-
-    return {
-      ts,
-      tC,
-      rh: rhVal,
-      td: Number.isFinite(td) ? td : undefined,
-      wMs: wMsVal,
-      raw: r,
-    };
-  }
-
-  return null;
+  const ts = toEpochSec(refISO);
+  return { T, RH, W, base_date, base_time, ts };
 }
 
-async function fetchLatestASOS(stn: string): Promise<{ tC: number; rh: number; wMs: number; feels: number; ts: number; latency: number; }> {
-  const trials: FetchOption[] = [
-    { help: 1, disp: 1, hours: 3 },
-    { help: 0, disp: 1, hours: 3 },
-    { help: 0, disp: 0, hours: 6 },
-  ];
-
-  let picked: PickedRow | null = null;
-  let lastLatency = 0;
-
-  for (const opt of trials) {
-    const t0 = Date.now();
-    picked = await tryFetch(stn, opt);
-    lastLatency = Date.now() - t0;
-    if (picked) break;
-  }
-  if (!picked) {
-    const e = new Error("ASOS: no data rows");
-    (e as any).__latency = lastLatency;
-    throw e;
-  }
-
-  const { tC, rh, wMs, ts } = picked;
-
-  // 3시간 초과 스테일 가드
-  const maxAgeSec = 3 * 3600;
-  if (Math.floor(Date.now() / 1000) - ts > maxAgeSec) {
-    const e = new Error("ASOS: stale data (>3h)");
-    (e as any).__latency = lastLatency;
-    (e as any).__stale = true;
-    throw e;
-  }
-
-  // 체감 계산
-  const feels =
-    (tC >= 26 && rh >= 40) ? apparentTempC(tC, rh, wMs)
-    : (tC <= 10 && wMs > 1.34) ? windChillC(tC, wMs)
-    : tC;
-
-  return { tC, rh, wMs, feels, ts, latency: lastLatency };
-}
-
-// ---------- 메인 ----------
 (async () => {
-  const stn = (env.ASOS_STN || "108").trim();
-  const loc = env.LOC || "seoul";
+  const loc = (env.LOC || 'seoul').trim();
+  const nx = (env.NX || '60').trim();
+  const ny = (env.NY || '127').trim();
+  const stn = (env.ASOS_STN || '108').trim(); // 태그 호환
 
+  const lines: string[] = [];
   try {
-    const { tC, rh, wMs, feels, ts, latency } = await fetchLatestASOS(stn);
+    const r = await fetchUltraNow(nx, ny);
+    if (r.T == null || r.RH == null || r.W == null || !Number.isFinite(r.ts)) throw new Error('Missing T/RH/W/ts');
+    const { method, value } = chooseFeels(r.T, r.RH, r.W);
+    const hi = heatIndexC(r.T, r.RH);
+    const wc = windChillC(r.T, r.W);
+    const at = apparentTempC(r.T, r.RH, r.W);
+    const base_s = toEpochSec(toIsoKst(r.base_date, r.base_time));
 
-    const now = Math.floor(Date.now() / 1000);
-    const lines = [
-      `life_index,source=kmahub-asos,loc=${loc},stn=${stn} ` +
-      `feels_c=${feels.toFixed(2)},temp_c=${tC},rh_pct=${rh},wind_ms=${wMs} ${ts}`,
-      `api_probe,service=asos_feels,env=prod,loc=${loc} success=1i,latency_ms=${latency}i ${now}`,
-    ];
+    const tags = `life_index,source=kma-ultra-ncst,loc=${loc},stn=${stn},method=${method}`;
+    const fields = [
+      `temp_c=${r.T.toFixed(2)}`,
+      `rh_pct=${r.RH.toFixed(1)}`,
+      `wind_ms=${r.W.toFixed(2)}`,
+      `feels_c=${value.toFixed(2)}`,
+      `heat_index_c=${hi.toFixed(2)}`,
+      `wind_chill_c=${wc.toFixed(2)}`,
+      `apparent_c=${at.toFixed(2)}`,
+      `base_time_s=${base_s}i`
+    ].join(',');
+    lines.push(`${tags} ${fields} ${r.ts}`);
 
-    await writeLP(lines);
-    console.log(`FeelsLike=${feels.toFixed(2)}C, Temp=${tC}C, RH=${rh}%, Wind=${wMs}m/s @ stn=${stn}`);
-    console.log("Influx write OK");
-  } catch (e: any) {
-    const locTag = env.LOC || "seoul";
-    const now = Math.floor(Date.now() / 1000);
-    const latency = Number.isFinite(e?.__latency) ? e.__latency : 0;
-
-    // 실패 시에도 잡이 죽지 않게: 실패 상태만 기록
-    const probe = `api_probe,service=asos_feels,env=prod,loc=${locTag} success=0i,latency_ms=${latency}i ${now}`;
-    try { await writeLP([probe]); } catch {}
-    console.error(e);
-    process.exit(0); // 스케줄 유지
+    const probeTs = Math.floor(Date.now()/1000);
+    lines.push(`api_probe,service=feels_ultra,env=prod,loc=${loc} success=1i,latency_ms=0i ${probeTs}`);
+  } catch (e:any) {
+    const probeTs = Math.floor(Date.now()/1000);
+    lines.push(`api_probe,service=feels_ultra,env=prod,loc=${(env.LOC||'seoul')} success=0i,latency_ms=${e?.latency||0}i,note="${String(e?.note||e?.message||'err').replace(/"/g,'\\"')}" ${probeTs}`);
   }
-})();
+
+  if (!lines.length) { console.warn('[WARN] No lines to write'); return; }
+  if (DBG) console.log('[SAMPLE]', lines[0]);
+  await writeLP(lines);
+  console.log(`[OK] Influx write done — lines=${lines.length}`);
+})().catch(err => { console.error(err?.message || err); process.exitCode = 0; });

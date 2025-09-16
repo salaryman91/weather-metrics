@@ -1,33 +1,50 @@
-name: pop-kmahub-schedule
+name: POP (rainfall + probability)
+
 on:
   schedule:
-    # KST 02/05/08/11/14/17/20/23 발표 +10분 (UTC 기준)
-    - cron: "10 2  * * *"
-    - cron: "10 5  * * *"
-    - cron: "10 8  * * *"
-    - cron: "10 11 * * *"
-    - cron: "10 14 * * *"
-    - cron: "10 17 * * *"
-    - cron: "10 20 * * *"
-    - cron: "10 23 * * *"
-  workflow_dispatch: {}
+    # 00/30분 기준 데이터 안정화 후 수집 (매 시각 05, 35분)
+    - cron: "5,35 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: pop
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      TZ: Asia/Seoul
-      INFLUX_URL:    ${{ secrets.INFLUX_URL }}
-      INFLUX_TOKEN:  ${{ secrets.INFLUX_TOKEN }}
-      INFLUX_ORG:    ${{ secrets.INFLUX_ORG }}
-      INFLUX_BUCKET: ${{ secrets.INFLUX_BUCKET }}
-      APIHUB_BASE:   ${{ vars.APIHUB_BASE }}
-      APIHUB_KEY:    ${{ secrets.APIHUB_KEY }}
-      POP_REG:       ${{ vars.POP_REG }}
-      LOC:           ${{ vars.LOC || 'seoul' }}
+    permissions:
+      contents: read
+    timeout-minutes: 5
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
-        with: { node-version: "20" }
-      - run: npm i -D typescript ts-node dotenv-cli @types/node
-      - run: npx ts-node scripts/pop_kmahub_to_influx.ts
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run POP (PCP + POP + RN1) ingest
+        env:
+          # --- Influx (vars + secret) ---
+          INFLUX_URL:     ${{ vars.INFLUX_URL }}
+          INFLUX_ORG:     ${{ vars.INFLUX_ORG }}
+          INFLUX_BUCKET:  ${{ vars.INFLUX_BUCKET }}
+          INFLUX_TOKEN:   ${{ secrets.INFLUX_TOKEN }}
+
+          # --- KMA API Hub ---
+          APIHUB_BASE:    ${{ vars.APIHUB_BASE }}    # e.g. https://apihub.kma.go.kr
+          APIHUB_KEY:     ${{ secrets.APIHUB_KEY }}
+
+          # --- Location tags / grid (vars) ---
+          POP_REG:        ${{ vars.POP_REG }}        # e.g. 11B10101 (서울)
+          LOC:            ${{ vars.LOC }}            # e.g. seoul
+          NX:             ${{ vars.NX }}             # e.g. 60
+          NY:             ${{ vars.NY }}             # e.g. 127
+
+          # 디버그가 필요하면 1로
+          # DEBUG_POP:    "1"
+        run: npx ts-node scripts/pop_kmahub_to_influx.ts
