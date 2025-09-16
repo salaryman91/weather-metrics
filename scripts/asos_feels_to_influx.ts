@@ -59,7 +59,6 @@ function bestIndex(rows:number[][], ok:(v:number)=>boolean, score?:(vals:number[
 }
 
 /* ---------- 체감온도 ---------- */
-// Rothfusz °F → °C
 function heatIndexC(tC:number, rh:number){
   const T=tC*9/5+32, R=rh;
   const HI=-42.379+2.04901523*T+10.14333127*R-0.22475541*T*R
@@ -67,12 +66,10 @@ function heatIndexC(tC:number, rh:number){
           +0.00085282*T*R*R -0.00000199*T*T*R*R;
   return (HI-32)*5/9;
 }
-// Wind Chill (C, m/s → km/h)
 function windChillC(tC:number, vMs:number){
   const v=vMs*3.6; if (tC>10 || v<=4.8) return tC;
   return 13.12 + 0.6215*tC - 11.37*Math.pow(v,0.16) + 0.3965*tC*Math.pow(v,0.16);
 }
-// Magnus식 RH from T/Td
 function rhFromTd(tC:number, tdC:number){
   const a=17.625, b=243.04;
   const gamma = (a*tdC)/(b+tdC) - (a*tC)/(b+tC);
@@ -106,20 +103,39 @@ function headerTokens(commentLines: string[], rowLen: number): string[] | null {
 }
 function idxByName(toks:string[]|null, re:RegExp){ return toks ? toks.findIndex(t=>re.test(t)) : -1; }
 
+/* ---------- KST 시간 문자열 ---------- */
+function ymdhmKST(dUTC: Date){
+  // UTC 기준 Date에 +9h 더한 뒤 "YYYYMMDDHHmm" 반환
+  const k = new Date(dUTC.getTime() + 9*3600*1000);
+  const yyyy = k.getUTCFullYear().toString();
+  const MM   = String(k.getUTCMonth()+1).padStart(2,"0");
+  const dd   = String(k.getUTCDate()).padStart(2,"0");
+  const HH   = String(k.getUTCHours()).padStart(2,"0");
+  const mm   = String(k.getUTCMinutes()).padStart(2,"0");
+  return `${yyyy}${MM}${dd}${HH}${mm}`;
+}
+
 /* ---------- ASOS 수집 & 파싱 ---------- */
 async function fetchLatestASOS(stn: string){
-  const now=new Date();
-  const tm2 = now.toISOString().replace(/[-:]/g,"").slice(0,12)+"00";
-  const tm1 = new Date(now.getTime()-3*3600*1000).toISOString().replace(/[-:]/g,"").slice(0,12)+"00";
+  // ★ tm1/tm2를 KST 기준으로 생성
+  const nowUTC = new Date();
+  const tm2 = ymdhmKST(nowUTC) + "00";
+  const tm1 = ymdhmKST(new Date(nowUTC.getTime() - 3*3600*1000)) + "00";
 
   const base=need("APIHUB_BASE");
-  const url = `${base}/api/typ01/url/kma_sfctm2.php?stn=${encodeURIComponent(stn)}&tm1=${tm1}&tm2=${tm2}&disp=1&help=1&authKey=${encodeURIComponent(need("APIHUB_KEY"))}`;
+  const key = need("APIHUB_KEY");
+  const url = `${base}/api/typ01/url/kma_sfctm2.php?stn=${encodeURIComponent(stn)}&tm1=${tm1}&tm2=${tm2}&disp=1&help=1&authKey=${encodeURIComponent(key)}`;
 
   const t0=Date.now();
   const res=await fetch(url);
   const latency=Date.now()-t0;
   const text=await res.text();
   if (!res.ok) throw new Error(`ASOS ${res.status}: ${text.slice(0,200)}`);
+
+  if (DBG) {
+    console.log("---- ASOS DEBUG url (masked) ----");
+    console.log(url.replace(key, "***"));
+  }
 
   const lines=toLines(text);
   const comments=lines.filter(l=>l.startsWith("#"));
@@ -139,13 +155,13 @@ async function fetchLatestASOS(stn: string){
   let iTD = idxByName(toks, /^(TD|DEW|이슬점)$/i);
 
   // 2차: 분포 기반 보정
-  const preferRH = (vals:number[]) => median(vals); // RH는 보통 중앙값이 큼
+  const preferRH = (vals:number[]) => median(vals);
   if (iTA<0) iTA = bestIndex(rowsN, v=>v>-50 && v<50);
   if (iWS<0) iWS = bestIndex(rowsN, v=>v>=0 && v<=60, vals=>vals.filter(v=>v>1.0).length);
   if (iHM<0) iHM = bestIndex(rowsN, v=>v>=0 && v<=100, preferRH);
   if (iTM<0){ const last=rowsS.at(-1)!; iTM = last.findIndex(v=>/^\d{12,14}$/.test(String(v))); }
-  if (iTD<0){ // Td는 온도와 같은 범위
-    iTD = bestIndex(rowsN, v=>v>-50 && v<50, vals => -median(vals)); // Td는 보통 TA보다 낮음 → 중앙값 작은 열을 선호
+  if (iTD<0){
+    iTD = bestIndex(rowsN, v=>v>-50 && v<50, vals => -median(vals)); // Td는 보통 TA보다 낮음
   }
 
   if (DBG) {
@@ -162,23 +178,22 @@ async function fetchLatestASOS(stn: string){
     const tC = num[iTA], wMs = num[iWS];
     if (!isFinite(tC) || !isFinite(wMs)) continue;
 
-    // RH 우선 얻기
+    // RH
     let rh = isFinite(num[iHM]) ? num[iHM] : NaN;
 
-    // Td 기반 RH 대체 후보
+    // Td 기반 RH 후보
     let rhTd = NaN;
     if (iTD>=0 && isFinite(num[iTD])) {
       const td=num[iTD];
       if (isFinite(td)) rhTd = rhFromTd(tC, td);
     }
 
-    // 따뜻한 시간에서 RH가 말이 안 되면(T>=18 & RH<20) Td기반으로 대체
+    // 따뜻한 시간 보정: T≥18 & RH<20 → Td 기반으로 대체
     if ((tC>=18 && (!isFinite(rh) || rh<20 || rh>100)) && isFinite(rhTd)) rh = rhTd;
 
-    // 범위 클램프
     if (!isFinite(rh) || rh<0 || rh>100) continue;
 
-    // 시각
+    // 시각(KST)
     let ts = Math.floor(Date.now()/1000);
     if (iTM>=0){ const t=parseKST12(String(raw[iTM]??"")); if (t) ts=t; }
 
@@ -198,7 +213,7 @@ async function fetchLatestASOS(stn: string){
       }
     }
 
-    if (DBG) console.log({ pickedRow: raw, idx:{iTM,iTA,iHM,iWS,iTD}, vals:{tC, rh, wMs, feels:+feels.toFixed(2)} });
+    if (DBG) console.log({ pickedRow: raw, idx:{iTM,iTA,iHM,iWS,iTD}, vals:{tC, rh, wMs, feels:+feels.toFixed(2)}, tm1, tm2 });
     return { tC, rh, wMs, feels, ts, latency };
   }
 
