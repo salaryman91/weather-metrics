@@ -194,35 +194,33 @@ function pickStationIndex(rows: string[][]): number {
 
 /** KST(Asia/Seoul) 기준 10분 단위 tm 목록 생성 (기본: 최근 6시간 = 36스텝) */
 function tmCandidates10m(backSteps = 36): string[] {
-  const STEP = 10 * 60 * 1000; // 10분
-  const KST = 9 * 60 * 60 * 1000;
+  const STEP = 10 * 60 * 1000;         // 10분
+  const KST = 9 * 60 * 60 * 1000;     // +9h (UTC→KST)
 
-  // KST epoch로 보정 후 10분 내림
   const nowUtc = Date.now();
-  let kstMs = nowUtc + KST;
-  kstMs -= kstMs % STEP;
 
-  // 주어진 epoch를 KST 캘린더로 포맷
-  const toParts = (msKst: number) => {
-    // Date에 바로 msKst를 넣고 Asia/Seoul로 포맷하면 KST 시점을 얻을 수 있음
-    const d = new Date(msKst);
+  // 1) KST 시계(벽시계)로 옮겨서 10분 경계로 내림
+  let kstClock = nowUtc + KST;
+  kstClock -= (kstClock % STEP);
+
+  const toParts = (msKstClock: number) => {
+    // 2) 실제 instant로 되돌린 뒤 KST로 포맷 => 이중보정 방지!
+    const instant = msKstClock - KST;
+    const d = new Date(instant);
     const fmt = new Intl.DateTimeFormat("en-GB", {
       timeZone: "Asia/Seoul",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", hour12: false,
     }).formatToParts(d);
-    const m = Object.fromEntries(fmt.map((p) => [p.type, p.value]));
+    const m = Object.fromEntries(fmt.map(p => [p.type, p.value]));
     return `${m.year}${m.month}${m.day}${m.hour}${m.minute}`;
   };
 
   const out: string[] = [];
   for (let i = 0; i < backSteps; i++) {
-    out.push(toParts(kstMs - i * STEP));
+    out.push(toParts(kstClock - i * STEP));
   }
+  if (DBG) console.log("tm candidates (KST 10m):", out.slice(0, 6));
   return out;
 }
 
