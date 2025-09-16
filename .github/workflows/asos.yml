@@ -21,4 +21,5 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: "20" }
       - run: npm i -D typescript ts-node dotenv-cli @types/node
+      - run: npm i iconv-lite
       - run: npx ts-node scripts/asos_feels_to_influx.ts
