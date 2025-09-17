@@ -4,19 +4,20 @@ import "dotenv/config";
 /**
  * Apparent Temperature(체감온도) + 현재기온 수집 → Influx
  *   Source: KMA API Hub Ultra Short NOWCAST (getUltraSrtNcst)
- *   사용 카테고리: T1H(기온, °C), REH(습도, %), WSD(풍속, m/s)
+ *   사용 카테고리: T1H(°C), REH(%), WSD(m/s)
  *
- * Ncst 규칙(실전 안정화):
- *   - 기준시각은 **HH00, HH30** (두 가지 모두 존재)
- *   - 데이터는 보통 기준시각 +10분 안팎부터 유효
- *   - 항상 "가장 최근 유효한 반시간 슬롯"을 찾고, 실패 시 30분 단위로 여러 슬롯을 백오프
+ * Ncst 안정화 규칙:
+ *   - 기준시각: HH00 / HH30 (둘 다 존재)  → 실제 데이터는 기준시각 +10분 주변부터 유효
+ *   - "가장 최근 유효 반시간 슬롯"을 찾고, 실패 시 30분 단위로 다중 폴백(기본 6 슬롯)
  *
  * Measurement (precision=s)
  *   life_index,source=kma-ultra-ncst,loc=<>,stn=<108>,method=hi|wc|at
  *     temp_c=<float>,rh_pct=<float>,wind_ms=<float>,feels_c=<float>,
  *     heat_index_c=<float>,wind_chill_c=<float>,apparent_c=<float>,
  *     base_time_s=<int>
- *   api_probe,service=feels_ultra,env=prod,loc=<loc> success=<int>,latency_ms=<int>
+ *
+ *   api_probe,service=feels_ultra,env=prod,loc=<loc>
+ *     success=<int>,latency_ms=<int>,base_time_s=<int>,age_s=<int>,ver="<str>"[,note="<str>"]
  */
 
 type Env = {
@@ -27,6 +28,7 @@ type Env = {
 const env = process.env as unknown as Env;
 const need = (k: keyof Env) => { const v = env[k]; if (!v) throw new Error(`[FATAL] Missing env: ${k}`); return v; };
 const DBG = !!(process.env.DEBUG || process.env.DEBUG_FEELS);
+const SVC_VER = "feels/2025-09-16.3";
 
 // ---------- time utils ----------
 const pad2 = (n: number) => String(n).padStart(2, "0");
@@ -35,11 +37,9 @@ const toIsoKst = (yyyymmdd: string, hhmm: string) =>
 const toEpochSec = (iso: string) => Math.floor(new Date(iso).getTime() / 1000);
 const yyyymmdd = (d: Date) => `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}`;
 
-/** 최근 유효 반시간(anchor) 산정: 
- *   m>=40 → HH30
- *   10<=m<40 → HH00
- *   m<10 → (HH-1)30
- * 이후 30분 단위로 최대 4~6개 슬롯 백오프
+/** 최근 유효 반시간(anchor) 산정:
+ *   m>=40 → HH30, 10<=m<40 → HH00, m<10 → (HH-1)30
+ * 이후 30분 단위로 최대 depth개의 슬롯 백오프(기본 6)
  */
 function halfHourAnchors(now = new Date(), depth = 6): Array<{base_date:string;base_time:string}> {
   const d = new Date(now);
@@ -69,6 +69,10 @@ async function writeLP(lines: string[]) {
   });
   if (!res.ok) throw new Error(`Influx write ${res.status}: ${await res.text().catch(()=>"...")}`);
 }
+
+// ---------- helpers ----------
+const esc = (s: string) => String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"'); // line protocol string field escape
+const nowSec = () => Math.floor(Date.now()/1000);
 
 // ---------- KMA JSON (typ02 → typ01) ----------
 async function callKMAJSON(params: Record<string,string>) {
@@ -142,19 +146,21 @@ async function fetchUltraNcst(nx:string, ny:string) {
     let T: number|undefined, RH: number|undefined, W: number|undefined;
     for (const it of out.items as any[]) {
       const cat = String(it.category);
-      const val = parseFloat(it.obsrValue ?? it.fcstValue);
+      const raw = it.obsrValue ?? it.fcstValue;
+      const val = raw == null ? NaN : parseFloat(raw);
+      if (!Number.isFinite(val)) continue;
       if (cat === 'T1H') T = val;
       else if (cat === 'REH') RH = val;
       else if (cat === 'WSD') W = val;
     }
     if (T == null || RH == null || W == null) { lastErr = new Error('Missing T/RH/W'); continue; }
 
-    // ts: 기준시각 + 10분(가시화 버킷과 실제 제공 시점을 맞추기 위함)
+    // ts: 기준시각 + 10분(가시화 눈금 및 실제 제공 타이밍과 매칭)
     const baseIso = toIsoKst(base_date, base_time);
     const tsBase = toEpochSec(baseIso);
     const ts = tsBase + 600; // +10m
 
-    return { T, RH, W, base_date, base_time, ts, latency: out.latency, base_s: tsBase };
+    return { T, RH, W, base_date, base_time, ts, latency: out.latency ?? 0, base_s: tsBase };
   }
   throw Object.assign(new Error('Ncst empty (all half-hour slots failed)'), { lastErr });
 }
@@ -167,9 +173,10 @@ async function fetchUltraNcst(nx:string, ny:string) {
 
   const lines: string[] = [];
   let latency = 0;
+
   try {
     const r = await fetchUltraNcst(nx, ny);
-    latency = r.latency ?? 0;
+    latency = r.latency;
 
     const { method, value } = chooseFeels(r.T!, r.RH!, r.W!);
     const hi = heatIndexC(r.T!, r.RH!);
@@ -188,16 +195,23 @@ async function fetchUltraNcst(nx:string, ny:string) {
       `base_time_s=${r.base_s}i`
     ].join(',');
 
+    // 데이터 포인트(실값)
     lines.push(`${tags} ${fields} ${r.ts}`);
-    lines.push(`api_probe,service=feels_ultra,env=prod,loc=${loc} success=1i,latency_ms=${latency}i ${Math.floor(Date.now()/1000)}`);
+
+    // Probe(성공): SLI/QA용
+    const now = nowSec();
+    const age = Math.max(0, now - r.ts);
+    lines.push(`api_probe,service=feels_ultra,env=prod,loc=${loc} success=1i,latency_ms=${latency}i,base_time_s=${r.base_s}i,age_s=${age}i,ver="${SVC_VER}" ${now}`);
 
     if (DBG) {
       console.log('[DEBUG] slot chosen:', r.base_date, r.base_time, '→ ts', r.ts);
       console.log('[SAMPLE]', lines[0]);
     }
   } catch (e:any) {
-    if (DBG) console.error('[DEBUG] fetch error', e?.message || e);
-    lines.push(`api_probe,service=feels_ultra,env=prod,loc=${(env.LOC||'seoul')} success=0i,latency_ms=${latency}i ${Math.floor(Date.now()/1000)}`);
+    const now = nowSec();
+    const note = esc(String(e?.note || e?.message || 'err').slice(0, 200));
+    lines.push(`api_probe,service=feels_ultra,env=prod,loc=${(env.LOC||'seoul')} success=0i,latency_ms=${latency}i,ver="${SVC_VER}",note="${note}" ${now}`);
+    if (DBG) console.error('[DEBUG] fetch error:', e?.message || e);
   }
 
   await writeLP(lines);
